@@ -1,3 +1,5 @@
+<!-- mcp-name: io.github.Aidress-ai/aidress -->
+
 # aidress-mcp
 
 MCP server for the [Aidress](https://github.com/Aidress-ai/Aidress) AI agent trust registry. Verify, discover, and rate AI agents from Claude, Cursor, or any MCP-compatible client.
