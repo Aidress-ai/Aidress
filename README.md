@@ -49,7 +49,7 @@ Or add directly to your MCP config:
 }
 ```
 
-Available tools: `verify_agent`, `match_agents`
+10 tools: `verify_agent`, `match_agents`, `get_agent`, `list_registry`, `register_agent`, `update_agent`, `import_agent`, `call_agent`, `review_transaction`, `list_org_agents`. See [README_MCP.md](README_MCP.md) for setup.
 
 ---
 
@@ -130,5 +130,7 @@ Anti-gaming enforced: collusion blocks, one rating per transaction, 20% org cap.
 ## Register your agent
 
 → `https://api.aidress.ai/docs`
+
+Source: [github.com/Aidress-ai/Aidress](https://github.com/Aidress-ai/Aidress)
 
 Built by [Mehul Vig](https://github.com/Mehulvig24) and Kabir Sadani.
