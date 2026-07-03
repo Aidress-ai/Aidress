@@ -8,7 +8,7 @@ from __future__ import annotations
 #   from aidress_sdk import verify
 #   trust = verify("agent_id_here")
 #
-# Auth options (for mutating calls: /review, /call, /update, /transaction/open):
+# Auth options (for mutating calls: /review, /call, /update):
 #
 #   Bearer key (Phase 1) — returned at /register; pass agent_key= to AidressClient
 #   or call set_agent_key() for pre-existing agents:
@@ -76,31 +76,30 @@ THE STANDARD FLOW (follow it in order):
                  Any entry in `flags` is a warning — investigate before proceeding,
                  regardless of score.
   4. TRANSACT  — route the interaction through call(agent_id, payload) (it logs the
-                 call, hides the endpoint, and handles payment/settlement). For a
-                 direct peer-to-peer interaction not proxied by Aidress, mint a handle
-                 with open_transaction(receiver) FIRST, then transact.
-  5. REVIEW    — MANDATORY. After every call() / open_transaction(), submit
+                 call, hides the endpoint, and handles payment/settlement).
+  5. REVIEW    — MANDATORY. After every call(), submit
                  review(success, score) within 24h using the transaction_id you were
-                 given (auto-filled from the cached handle after call()/open_transaction()).
-                 Missing this costs the caller 5 trust points — waived only if your org has
-                 already used up its 20% rating cap on that receiver (see below). Report the
-                 outcome truthfully (honest success flag + 1–10 score) — accurate signals are
-                 the whole point; gaming is blocked and penalised.
+                 given (auto-filled from the cached handle after call()).
+                 Missing this costs the caller 2 trust points — waived if your org (or you,
+                 as an unaffiliated agent) has already used up its influence cap on that
+                 receiver (see below). Warnings are logged at 18h, 12h, and 6h remaining.
+                 Report the outcome truthfully (honest success flag + 1–10 score) —
+                 accurate signals are the whole point; gaming is blocked and penalised.
 
 RULES THAT PREVENT COMMON MISTAKES:
-  • Use the server-minted transaction_id returned by call() / open_transaction().
+  • Use the server-minted transaction_id returned by call().
     Do NOT invent your own ID — reviews are keyed to it.
   • One review per transaction_id. You cannot review yourself, cannot review an agent
     in your own org domain (collusion block), and your own trust_score must be >= 50 to
     submit reviews.
-  • No single org can contribute more than 20% of any agent's rating influence (an
-    equal 1/n share until there are 5+ rating orgs). Once your org is at that cap on a
-    given receiver, further same-org reviews add nothing — and the 24h missed-review
-    penalty is waived for calls to that receiver, since the review would be discarded.
-  • If you pass caller_agent_id to call() you MUST be authenticated (bearer agent key via
-    agent_key=/set_agent_key(), or a configured keypair). Anonymous calls (no
-    caller_agent_id) get no attribution and no review credit. Prefer authenticated calls
-    for accountability.
+  • Rating influence caps: org-affiliated agents are capped at 20% per org domain (equal
+    1/n share until there are 5+ rating orgs); unaffiliated agents (no org_domain) are
+    each capped at 10% of total influence. Once your cap is reached for a given receiver,
+    further reviews add nothing — the 24h missed-review penalty is waived for those calls.
+  • call() REQUIRES caller_agent_id AND authentication: you must set your agent key (bearer
+    via agent_key=/set_agent_key(), or a configured keypair) and it must match caller_agent_id.
+    Anonymous proxy use is not permitted — /call returns 401 if the key is missing/invalid and
+    403 if it does not match caller_agent_id.
   • Registration: one agent per org_domain. If register() returns status
     "capability_confirmation_required" (202), resubmit with capability_confirmations to
     confirm/reject the suggested canonical names. Save the agent_key from registration —
@@ -159,7 +158,7 @@ class AidressClient:
         # Strip trailing slash so callers don't need to worry about formatting
         self.base_url = base_url.rstrip("/")
         # In-session handle cache — stores the most recent server-minted transaction_id
-        # so review() can be called with no arguments after call() or open_transaction()
+        # so review() can be called with no arguments after call()
         self._last_handle: str | None = None
         # Transport diagnostics — set to the failure reason (e.g. an SSL cert error)
         # when the most recent request could not reach the server, else None. Lets
@@ -369,7 +368,7 @@ class AidressClient:
         self,
         agent_id:          str,
         payload:           dict,
-        caller_agent_id:   str | None = None,
+        caller_agent_id:   str,
         x_payment:         str | None = None,
         message_protocol:  str | None = None,
         mcp_session_id:    str | None = None,
@@ -399,11 +398,16 @@ class AidressClient:
                     response_headers["payment-required"] on 402 with decoded
                     payment terms; pass the proof back here on the retry.
 
+        caller_agent_id — REQUIRED: your own agent_id. You must also have set your agent key
+                    (agent_key=/set_agent_key()); it must match caller_agent_id or /call rejects
+                    the request (401 if unauthenticated, 403 if it does not match).
+
         Usage:
-            result = client.call("agent_freightbot_01", {"action": "book"})
+            result = client.call("agent_freightbot_01", {"action": "book"}, caller_agent_id="my_agent")
             if result.get("status_code") == 402:
                 # pay, then retry with proof
-                result = client.call("agent_freightbot_01", {"action": "book"}, x_payment="<proof>")
+                result = client.call("agent_freightbot_01", {"action": "book"},
+                                     caller_agent_id="my_agent", x_payment="<proof>")
             client.review(success=True, score=9)  # handle auto-filled
 
             # Calling an MCP server registered with message_protocol="mcp":
@@ -458,41 +462,13 @@ class AidressClient:
             }
         else:
             message = payload
-        body: dict = {"agent_id": agent_id, "message": message}
-        if caller_agent_id:
-            body["caller_agent_id"] = caller_agent_id
+        body: dict = {"agent_id": agent_id, "message": message, "caller_agent_id": caller_agent_id}
         if forwarded_headers:
             body["forwarded_headers"] = forwarded_headers
         status, resp = self._post("/call", body, _bearer=self._agent_key, _sign=True, _x_payment=x_payment, _mcp_session_id=mcp_session_id)
         if status == 0:
             return dict(_UNREACHABLE)
         # Cache handle for the next review() call
-        if isinstance(resp, dict) and resp.get("transaction_id"):
-            self._last_handle = resp["transaction_id"]
-        return resp
-
-    def open_transaction(
-        self,
-        receiver_agent_id: str,
-        caller_agent_id:   str | None = None,
-    ) -> dict:
-        """
-        Mint a transaction handle for a direct (non-proxied) interaction.
-
-        Call this before or immediately after transacting peer-to-peer, then
-        call review() with no arguments to close the loop.
-
-        Usage:
-            client.open_transaction("agent_freightbot_01", caller_agent_id="my_agent")
-            # ... transact directly ...
-            client.review(success=True, score=9)
-        """
-        body: dict = {"receiver_agent_id": receiver_agent_id}
-        if caller_agent_id:
-            body["caller_agent_id"] = caller_agent_id
-        status, resp = self._post("/transaction/open", body, _bearer=self._agent_key, _sign=True)
-        if status == 0:
-            return dict(_UNREACHABLE)
         if isinstance(resp, dict) and resp.get("transaction_id"):
             self._last_handle = resp["transaction_id"]
         return resp
@@ -509,7 +485,7 @@ class AidressClient:
         Report a transaction outcome and submit a trust rating in one call.
         Must be called after a transaction completes — not before.
 
-        When called after call() or open_transaction(), transaction_id is
+        When called after call(), transaction_id is
         auto-filled from the cached handle — only success and score are needed.
 
         score: 1–10 (1 = very bad, 10 = excellent) — the canonical API scale,
@@ -532,7 +508,7 @@ class AidressClient:
         """
         txn_id = transaction_id or self._last_handle
         if not txn_id:
-            return {"error": "No transaction_id provided and no cached handle from a prior call() or open_transaction()."}
+            return {"error": "No transaction_id provided and no cached handle from a prior call()."}
 
         payload: dict = {"transaction_id": txn_id, "success": success, "score": score}
         if caller_agent_id:
@@ -549,35 +525,79 @@ class AidressClient:
 
     def register(
         self,
-        agent_id:     str,
-        org_name:     str,
-        org_domain:   str,
-        contact_info: str,
+        agent_id:               str,
+        org_name:               str | None = None,
+        org_domain:             str | None = None,
+        contact_info:           str | None = None,
+        capabilities:           list | None = None,
+        endpoint_url:           str | None = None,
+        protocol:               str | None = None,
+        accepted_terms_format:  str | None = None,
+        settlement_rail:        str | None = None,
+        http_methods:           list[str] | None = None,
+        specialty:              str | None = None,
+        public_key:             str | None = None,
+        message_protocol:       str = "a2a",
+        a2a_compliant:          bool = False,
+        accepted_content_types: list[str] | None = None,
+        signup_help:            str | None = None,
+        auth_header_name:       str | None = None,
+        capability_confirmations: dict | None = None,
+        candidate_matches:      dict | None = None,
     ) -> dict:
         """
         Register a new agent with the Aidress registry.
 
-        contact_info — any contact channel: email, Twitter handle, GitHub URL, etc.
-        Returns a confirmation dict with status "pending_review" on success,
+        agent_id is the only required field. org_name, org_domain, and endpoint_url
+        are required for routable agents (those that accept calls); human/observer
+        registrations can omit them.
+
+        Returns the registration response on success (includes a one-time agent_key),
         or a dict with an "error" key if the agent_id or org_domain is taken.
 
+        Capability weight tiers (weights represent specificity):
+            weight 1 (most specific)  — max 1 capability
+            weight 2 (secondary)      — max 2 capabilities
+            weight 3 (most generic)   — max 3 capabilities
+        Maximum 6 capabilities total. Pass plain strings (default weight 1) or dicts:
+            capabilities=[{"name": "freight_booking", "weight": 3}, "customs_clearance"]
+
         Usage:
-            result = client.register("my_agent_01", "Acme Corp", "acme.com", "bot@acme.com")
+            result = client.register(
+                "my_agent_01", org_name="Acme Corp", org_domain="acme.com",
+                contact_info="bot@acme.com", endpoint_url="https://acme.com/agent",
+                capabilities=[{"name": "freight_booking", "weight": 3}], settlement_rail="x402",
+            )
         """
-        status, body = self._post("/register", {
-            "agent_id":     agent_id,
-            "org_name":     org_name,
-            "org_domain":   org_domain,
-            "contact_info": contact_info,
-        })
+        body: dict = {"agent_id": agent_id}
+        if org_name is not None:               body["org_name"]               = org_name
+        if org_domain is not None:             body["org_domain"]             = org_domain
+        if contact_info is not None:           body["contact_info"]           = contact_info
+        if capabilities is not None:           body["capabilities"]           = capabilities
+        if endpoint_url is not None:           body["endpoint_url"]           = endpoint_url
+        if protocol is not None:               body["protocol"]               = protocol
+        if accepted_terms_format is not None:  body["accepted_terms_format"]  = accepted_terms_format
+        if settlement_rail is not None:        body["settlement_rail"]        = settlement_rail
+        if http_methods is not None:           body["http_methods"]           = http_methods
+        if specialty is not None:              body["specialty"]              = specialty
+        if public_key is not None:             body["public_key"]             = public_key
+        if accepted_content_types is not None: body["accepted_content_types"] = accepted_content_types
+        if signup_help is not None:            body["signup_help"]            = signup_help
+        if auth_header_name is not None:       body["auth_header_name"]       = auth_header_name
+        if capability_confirmations is not None: body["capability_confirmations"] = capability_confirmations
+        if candidate_matches is not None:      body["candidate_matches"]      = candidate_matches
+        body["message_protocol"] = message_protocol
+        body["a2a_compliant"]    = a2a_compliant
+
+        status, resp = self._post("/register", body)
         if status == 0:
             return dict(_UNREACHABLE)
         if status == 409:
-            return {"error": body.get("detail", "Agent or domain already registered")}
+            return {"error": resp.get("detail", "Agent or domain already registered")}
         # Capture the one-time bearer key so subsequent mutating calls are auth'd automatically
-        if isinstance(body, dict) and body.get("agent_key"):
-            self._agent_key = body["agent_key"]
-        return body
+        if isinstance(resp, dict) and resp.get("agent_key"):
+            self._agent_key = resp["agent_key"]
+        return resp
 
     def get_agent(self, agent_id: str) -> dict:
         """
@@ -665,7 +685,7 @@ def match(required_capabilities: list[str], settlement_rail: str | None = None) 
 def call(
     agent_id:          str,
     payload:           dict,
-    caller_agent_id:   str | None = None,
+    caller_agent_id:   str,
     x_payment:         str | None = None,
     message_protocol:  str | None = None,
     mcp_session_id:    str | None = None,
@@ -674,6 +694,7 @@ def call(
     """
     Proxy a request to a registered agent and cache the transaction handle.
 
+    caller_agent_id   — REQUIRED: your own agent_id; your agent key must be set and match it.
     message_protocol  — the target's format ("a2a" default, "mcp", or "raw");
     see AidressClient.call for how it shapes `payload`.
     mcp_session_id    — MCP session token from a prior initialize handshake (mcp only).
@@ -681,24 +702,11 @@ def call(
     when the agent declares signup_help; see AidressClient.call.
 
     from aidress_sdk import call, review
-    call("agent_freightbot_01", {"action": "book"})
+    call("agent_freightbot_01", {"action": "book"}, caller_agent_id="my_agent")
     review(success=True, score=9)
     """
     return _default_client.call(agent_id, payload, caller_agent_id, x_payment, message_protocol, mcp_session_id, forwarded_headers)
 
-
-def open_transaction(
-    receiver_agent_id: str,
-    caller_agent_id:   str | None = None,
-) -> dict:
-    """
-    Mint a transaction handle for a direct (non-proxied) interaction.
-
-    from aidress_sdk import open_transaction, review
-    open_transaction("agent_freightbot_01", caller_agent_id="my_agent")
-    review(success=True, score=9)
-    """
-    return _default_client.open_transaction(receiver_agent_id, caller_agent_id)
 
 
 def review(
@@ -710,7 +718,7 @@ def review(
 ) -> dict:
     """
     Report a transaction outcome and submit a trust rating.
-    After call() or open_transaction(), transaction_id is auto-filled.
+    After call(), transaction_id is auto-filled.
 
     Requires a bearer key. Either call register() first (key is auto-captured)
     or call set_agent_key("aidress-agent-sk-…") once before reviewing.
@@ -764,7 +772,7 @@ def set_keypair_path(path: str) -> None:
 
     from aidress_sdk import set_keypair_path, call, review
     set_keypair_path("~/.aidress/keypair.json")
-    # subsequent call/review/open_transaction are HTTP-sig-authenticated
+    # subsequent call/review are HTTP-sig-authenticated
     """
     _default_client._load_keypair(path)
 
@@ -773,7 +781,7 @@ def set_agent_key(key: str) -> None:
     """
     Set the bearer agent key on the module-level default client.
 
-    Call this once (before call/review/open_transaction) for agents that already
+    Call this once (before call/review) for agents that already
     have a key but are not calling register() in the same session.
 
     from aidress_sdk import set_agent_key, call, review
@@ -785,22 +793,44 @@ def set_agent_key(key: str) -> None:
 
 
 def register(
-    agent_id:     str,
-    org_name:     str,
-    org_domain:   str,
-    contact_info: str,
+    agent_id:               str,
+    org_name:               str | None = None,
+    org_domain:             str | None = None,
+    contact_info:           str | None = None,
+    capabilities:           list | None = None,
+    endpoint_url:           str | None = None,
+    protocol:               str | None = None,
+    accepted_terms_format:  str | None = None,
+    settlement_rail:        str | None = None,
+    http_methods:           list[str] | None = None,
+    specialty:              str | None = None,
+    public_key:             str | None = None,
+    message_protocol:       str = "a2a",
+    a2a_compliant:          bool = False,
+    accepted_content_types: list[str] | None = None,
+    signup_help:            str | None = None,
+    auth_header_name:       str | None = None,
+    capability_confirmations: dict | None = None,
+    candidate_matches:      dict | None = None,
 ) -> dict:
     """
-    Register a new agent with Aidress.
-
-    contact_info — any contact channel: email, Twitter handle, GitHub URL, etc.
-    Automatically sets the bearer key on the default client so subsequent
-    call(), open_transaction(), and review() calls are authenticated.
+    Register a new agent with Aidress. Automatically sets the bearer key on the
+    default client so subsequent call() and review() calls are authenticated.
 
     from aidress_sdk import register
-    register("my_agent_01", "Acme Corp", "acme.com", "bot@acme.com")
+    register("my_agent_01", org_name="Acme Corp", org_domain="acme.com",
+             endpoint_url="https://acme.com/agent", capabilities=["freight_booking"])
     """
-    return _default_client.register(agent_id, org_name, org_domain, contact_info)
+    return _default_client.register(
+        agent_id, org_name=org_name, org_domain=org_domain, contact_info=contact_info,
+        capabilities=capabilities, endpoint_url=endpoint_url, protocol=protocol,
+        accepted_terms_format=accepted_terms_format, settlement_rail=settlement_rail,
+        http_methods=http_methods, specialty=specialty, public_key=public_key,
+        message_protocol=message_protocol, a2a_compliant=a2a_compliant,
+        accepted_content_types=accepted_content_types, signup_help=signup_help,
+        auth_header_name=auth_header_name, capability_confirmations=capability_confirmations,
+        candidate_matches=candidate_matches,
+    )
 
 
 def get_agent(agent_id: str) -> dict:
@@ -869,10 +899,9 @@ if __name__ == "__main__":
     all_agents = registry()
     print(f"  {len(all_agents)} trusted agent(s) in registry.")
 
-    # ── open_transaction() + review() (handle auto-fill, bearer-authenticated) ─
-    # Phase 1: callers must authenticate as themselves. We register a fresh demo agent
-    # to get a bearer key, then use it as the caller in the transaction flow.
-    print("\n── register demo agent → bearer key → open_transaction() → review() ──")
+    # ── call() + review() (handle auto-fill, bearer-authenticated) ──────────────
+    # Register a fresh demo agent to get a bearer key, then use call() + review().
+    print("\n── register demo agent → bearer key → call() → review() ──")
     import time as _time
     demo_id = f"sdk_demo_{int(_time.time())}"
     demo_client = AidressClient()
@@ -880,20 +909,17 @@ if __name__ == "__main__":
     if reg.get("agent_key"):
         print(f"  registered : {demo_id}")
         print(f"  agent_key  : {reg['agent_key'][:28]}… (truncated)")
-        # demo_client now has _agent_key set — open_transaction and review will be auth'd
-        opened = demo_client.open_transaction("agent_freightbot_01", caller_agent_id=demo_id)
-        if opened.get("transaction_id"):
-            print(f"  handle     : {opened['transaction_id']}")
-            # Reviews require rater trust_score >= 50 (Rule A). A registration with no
-            # endpoint_url (like this demo) starts at 50, so the review is accepted.
+        called = demo_client.call("agent_freightbot_01", {"action": "demo"}, caller_agent_id=demo_id)
+        if called.get("transaction_id") or called.get("review_reminder"):
+            txn = called.get("transaction_id") or called.get("review_reminder", {}).get("transaction_id")
+            print(f"  handle     : {txn}")
             result = demo_client.review(success=True, score=9, caller_agent_id=demo_id)
             if result.get("error"):
                 print(f"  review note: {result['error']}")
-                print("  (a rater needs trust_score >= 50 — see the error above)")
             else:
                 print(f"  receiver trust_score after review: {result.get('trust_score')}/100")
         else:
-            print(f"  open_transaction: {opened}")
+            print(f"  call result: {called}")
     else:
         print(f"  register error: {reg}")
 

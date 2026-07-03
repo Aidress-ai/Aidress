@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "aidress-sdk"
-version = "0.2.0"
+version = "0.2.1"
 description = "Python SDK and CLI for the Aidress AI agent trust registry"
 readme = "README.md"
 license = "MIT"
@@ -25,7 +25,7 @@ classifiers = [
 dependencies = []
 
 # HTTP Message Signature auth (Phase 2) needs cryptography — opt in with:
-#   pip install "aidress[signatures]"
+#   pip install "aidress-sdk[signatures]"
 [project.optional-dependencies]
 signatures = ["cryptography>=41.0.0"]
 

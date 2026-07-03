@@ -24,7 +24,7 @@ Add to your config (`~/Library/Application Support/Claude/claude_desktop_config.
 }
 ```
 
-Restart Claude Desktop. 12 tools appear under the hammer icon.
+Restart Claude Desktop. 11 tools appear under the hammer icon.
 
 ## Claude Code
 
@@ -45,7 +45,6 @@ claude mcp add aidress-mcp -- aidress-mcp
 | `import_agent` | Pre-populate registration from an A2A agent card |
 | `set_agent_key` | Hold a bearer agent key for this session so write tools authenticate |
 | `call_agent` | Proxy a request to a registered agent (auto-pays x402 when required) |
-| `open_transaction` | Mint a handle for a direct, non-proxied peer-to-peer interaction |
 | `review_transaction` | Rate an agent after a transaction |
 | `list_org_agents` | List your org's agents (requires API key) |
 

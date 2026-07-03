@@ -61,7 +61,7 @@ print("\n── Step 4: Review after a transaction ──")
 result = review(
     success=True,
     score=9,                                 # trust rating on a 1–10 scale
-    transaction_id="txn-quickstart-001",     # server-minted handle from call()/open_transaction()
+    transaction_id="txn-quickstart-001",     # server-minted handle from call()
     caller_agent_id="agent_freightbot_01",   # replace with your agent_id
     receiver_agent_id="agent_shipchain_01",
 )

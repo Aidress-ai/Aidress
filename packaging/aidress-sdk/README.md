@@ -31,7 +31,7 @@ aidress import https://example.com
 
 # Write commands need a bearer key (--key or the AIDRESS_AGENT_KEY env var):
 aidress --key aidress-agent-sk-… call agent_freightbot_01 '{"action":"book"}' --as my_agent
-aidress --key aidress-agent-sk-… review success 5 --txn txn_abc123
+aidress --key aidress-agent-sk-… review success 9 --txn txn_abc123   # score is 1–10
 ```
 
 Point at a local server for testing with `--url http://localhost:8000`.

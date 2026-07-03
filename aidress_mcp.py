@@ -37,7 +37,7 @@
 #                         list_org_agents. Leave unset to use public-only tools.
 #   AIDRESS_AGENT_KEY   — Bearer agent key (aidress-agent-sk-…) minted at /register
 #                         or via /admin/set-agent-key. Required for call_agent,
-#                         open_transaction, review_transaction, and update_agent.
+#                         review_transaction, and update_agent.
 #   AIDRESS_KEYPAIR_PATH — Path to an Ed25519 keypair JSON file created by
 #                         generate_keypair() in aidress_sdk.py. When set, mutating
 #                         tool calls are HTTP-Message-Signed instead of bearer-authed.
@@ -64,7 +64,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 BASE_URL     = os.environ.get("AIDRESS_BASE_URL", "https://api.aidress.ai").rstrip("/")
 API_KEY      = os.environ.get("AIDRESS_API_KEY")     # Org key — for register (auto-verify), update, list_org_agents
-AGENT_KEY    = os.environ.get("AIDRESS_AGENT_KEY")   # Bearer agent key — for call, open_transaction, review, update
+AGENT_KEY    = os.environ.get("AIDRESS_AGENT_KEY")   # Bearer agent key — for call, review, and update
 KEYPAIR_PATH = os.environ.get("AIDRESS_KEYPAIR_PATH")  # Ed25519 keypair JSON — alternative to bearer
 
 # In-session bearer key set by set_agent_key() — takes effect immediately without
@@ -138,29 +138,29 @@ THE STANDARD FLOW (follow it in order):
                  Any entry in `flags` is a warning — investigate before proceeding,
                  regardless of score.
   4. TRANSACT  — route the interaction through call_agent (it logs the call, hides the
-                 endpoint, and handles payment/settlement). For a direct peer-to-peer
-                 interaction not proxied by Aidress, mint a handle with open_transaction
-                 FIRST, then transact.
-  5. REVIEW    — MANDATORY. After every call_agent / open_transaction, submit
+                 endpoint, and handles payment/settlement).
+  5. REVIEW    — MANDATORY. After every call_agent, submit
                  review_transaction within 24h using the transaction_id you were given.
-                 Missing this costs the caller 5 trust points — waived only if your org has
-                 already used up its 20% rating cap on that receiver (see below). Report the
-                 outcome truthfully (honest success flag + 1–10 score) — accurate signals are
-                 the whole point; gaming is blocked and penalised.
+                 Missing this costs the caller 2 trust points — waived if your org (or you,
+                 as an unaffiliated agent) has already used up its influence cap on that
+                 receiver (see below). Warnings are logged at 18h, 12h, and 6h remaining.
+                 Report the outcome truthfully (honest success flag + 1–10 score) —
+                 accurate signals are the whole point; gaming is blocked and penalised.
 
 RULES THAT PREVENT COMMON MISTAKES:
-  • Use the server-minted transaction_id returned by call_agent / open_transaction.
+  • Use the server-minted transaction_id returned by call_agent.
     Do NOT invent your own ID — reviews are keyed to it.
   • One review per transaction_id. You cannot review yourself, cannot review an agent
     in your own org domain (collusion block), and your own trust_score must be >= 50 to
     submit reviews.
-  • No single org can contribute more than 20% of any agent's rating influence (an
-    equal 1/n share until there are 5+ rating orgs). Once your org is at that cap on a
-    given receiver, further same-org reviews add nothing — and the 24h missed-review
-    penalty is waived for calls to that receiver, since the review would be discarded.
-  • If you pass caller_agent_id to call_agent you MUST be authenticated (bearer agent key
-    via set_agent_key, or a configured keypair). Anonymous calls (no caller_agent_id) get
-    no attribution and no review credit. Prefer authenticated calls for accountability.
+  • Rating influence caps: org-affiliated agents are capped at 20% per org domain (equal
+    1/n share until there are 5+ rating orgs); unaffiliated agents (no org_domain) are
+    each capped at 10% of total influence. Once your cap is reached for a given receiver,
+    further reviews add nothing — the 24h missed-review penalty is waived for those calls.
+  • call_agent REQUIRES caller_agent_id AND authentication: set your agent key (via
+    set_agent_key, or a configured keypair) and it must match caller_agent_id. Anonymous
+    proxy use is not permitted — /call returns 401 if the key is missing/invalid and 403 if
+    it does not match caller_agent_id.
   • Registration: one agent per org_domain. If register_agent returns status
     "capability_confirmation_required" (202), resubmit with capability_confirmations to
     confirm/reject the suggested canonical names. Save the agent_key from registration —
@@ -318,10 +318,10 @@ async def verify_agent(agent_id: str) -> dict:
     expects: currency, date_format, quantity_unit, weight_unit).
 
     Trust tiers:
-      0        — unregistered, block
-      40       — pending review, proceed with caution
-      50–69    — caution, apply limits
-      70–100   — trusted, proceed
+      0        — unregistered → do not transact
+      1–49     — not trusted (40 = pending review) → do not transact
+      50–69    — caution → proceed only with safeguards
+      70–100   — trusted → proceed
 
     Always check payload_schema before calling an agent so your payload
     uses the correct currency, units, and date format.
@@ -458,7 +458,11 @@ async def register_agent(
       capabilities           — list of capabilities. Each can be a plain string like
                                "freight_booking" or a dict with name and weight like
                                {"name": "freight_booking", "weight": 2}. Weight defaults
-                               to 1. Max 1 capability at weight >= 3, max 2 at weight 2.
+                               to 1. Weights represent specificity tiers:
+                                 weight 1 (most specific)  — max 1 capability
+                                 weight 2 (secondary)      — max 2 capabilities
+                                 weight 3 (most generic)   — max 3 capabilities
+                               Maximum 6 capabilities total across all tiers.
       endpoint_url           — HTTPS URL where this agent accepts /call requests.
                                Omit entirely if registering a human (demand-side only).
       protocol               — "REST", "GraphQL", or "gRPC"
@@ -684,7 +688,7 @@ async def set_agent_key(agent_key: str) -> dict:
     Store a bearer agent key for the duration of this MCP session.
 
     Use this immediately after register_agent returns an agent_key — it lets
-    update_agent, call_agent, open_transaction, and review_transaction
+    update_agent, call_agent, and review_transaction
     authenticate without restarting the server or changing environment variables.
 
     Why not pass the key on each individual tool call?
@@ -726,7 +730,7 @@ async def set_agent_key(agent_key: str) -> dict:
 async def call_agent(
     agent_id:          str,
     payload:           dict,
-    caller_agent_id:   Optional[str] = None,
+    caller_agent_id:   str,
     x_payment:         Optional[str] = None,
     message_protocol:  Optional[str] = None,
     mcp_session_id:    Optional[str] = None,
@@ -735,12 +739,10 @@ async def call_agent(
     """
     Send a request to a registered agent through the Aidress proxy.
 
-    All calls are logged. Only submit a review when the response includes a
-    review_reminder field — this indicates payment was confirmed and a service
-    exchange occurred. Not all calls result in a settled transaction.
-
-    When review_reminder is present, pass the transaction_id from it to
-    review_transaction to record the outcome.
+    All calls are logged. Always submit a review within 24h via review_transaction
+    after every call_agent — the missed-review penalty applies to all calls.
+    Check review_reminder in the response: if it says "no review needed" (your
+    influence cap is already hit), you can skip. Otherwise, review every time.
 
     agent_id        — the agent to call
     message_protocol — the target's message format, from its trust object (verify_agent /
@@ -825,7 +827,9 @@ async def call_agent(
 
                       Check payload_schema on the agent (via verify_agent or match_agents) before
                       sending — mismatched currency, units, or date formats return 409.
-    caller_agent_id — your agent's ID (optional but recommended for accountability)
+    caller_agent_id — REQUIRED: your agent's ID. Your agent key must be set (see Auth below)
+                      and must match this value, or /call rejects the request (401 if the key is
+                      missing/invalid, 403 if it does not match). Anonymous calls are not allowed.
     x_payment       — Usually leave this UNSET. It is for advanced manual control: a
                       base64-encoded x402 PaymentPayload (V2) you have already signed with
                       your own wallet. When provided it is forwarded verbatim to the
@@ -856,7 +860,7 @@ async def call_agent(
                       Aidress (no tracking, no transaction record). Rail-agnostic: pay_via
                       relays whatever rail the counterpart uses (x402 today, others later).
 
-    Auth (required only when caller_agent_id is provided):
+    Auth (REQUIRED — every call must be authenticated):
       Set AIDRESS_AGENT_KEY env var before starting the server, or call
       set_agent_key("<key>") once in-session after registering, or configure
       AIDRESS_KEYPAIR_PATH for Ed25519 HTTP Message Signatures (RFC 9421).
@@ -883,9 +887,7 @@ async def call_agent(
         }
     else:
         message = payload
-    body: dict = {"agent_id": agent_id, "message": message}
-    if caller_agent_id:
-        body["caller_agent_id"] = caller_agent_id
+    body: dict = {"agent_id": agent_id, "message": message, "caller_agent_id": caller_agent_id}
     if forwarded_headers:
         body["forwarded_headers"] = forwarded_headers
 
@@ -926,85 +928,45 @@ async def call_agent(
 
 @mcp.tool()
 async def review_transaction(
-    transaction_id:    str,
+    caller_agent_id:   str,
+    receiver_agent_id: str,
     success:           bool,
     score:             int,
-    caller_agent_id:   Optional[str] = None,
-    receiver_agent_id: Optional[str] = None,
 ) -> dict:
     """
-    Submit a trust review after a payment-confirmed transaction with another agent.
-    Only call this when call_agent returned a review_reminder field — that field
-    signals that payment was confirmed and a review is expected. Calls with no
-    payment do not require a review.
+    Submit a trust review after a confirmed exchange with another agent.
 
-    When transaction_id is a handle from call_agent or open_transaction, caller and
-    receiver are looked up automatically — only transaction_id, success, and score
-    are required.
+    The system automatically finds the most recent unreviewed executed exchange
+    between the two agents — no transaction_id needed. Reviews without a real
+    prior /call exchange are rejected.
 
-    transaction_id     — the handle returned by call_agent (from review_reminder) or open_transaction
-    success            — True if the transaction completed successfully
-    score              — trust rating 1 (very poor) to 10 (excellent)
-    caller_agent_id    — only needed for bring-your-own transaction IDs
-    receiver_agent_id  — only needed for bring-your-own transaction IDs
+    caller_agent_id   — the agent submitting the review (must match your bearer key)
+    receiver_agent_id — the agent being reviewed
+    success           — True if the transaction completed successfully
+    score             — trust rating 1 (very poor) to 10 (excellent)
 
     Auth (always required):
       Set AIDRESS_AGENT_KEY env var before starting the server, or call
       set_agent_key("<key>") once in-session after registering, or configure
       AIDRESS_KEYPAIR_PATH for Ed25519 HTTP Message Signatures (RFC 9421).
-      Per-call key parameters are intentionally absent — bearer tokens passed as
-      tool arguments appear in conversation history and MCP protocol trace logs.
 
     Anti-gaming rules enforced:
-      - Caller trust_score must be >= 50 to submit reviews
+      - Caller trust_score must be >= 50
       - Cannot review your own agent
       - Cannot review agents from the same org domain (collusion block)
-      - One review per transaction_id
-      - No single org contributes more than 20% of an agent's rating influence
-        (an equal 1/n share until 5+ rating orgs); reviews beyond that share are capped
+      - One review per executed exchange
+      - No single org contributes more than 20% of an agent's rating influence; unaffiliated agents (no org_domain) are each capped at 10%
 
     Returns the updated trust object for the reviewed agent.
     """
     body: dict = {
-        "transaction_id": transaction_id,
-        "success":        success,
-        "score":          score,
+        "caller_agent_id":   caller_agent_id,
+        "receiver_agent_id": receiver_agent_id,
+        "success":           success,
+        "score":             score,
     }
-    if caller_agent_id:
-        body["caller_agent_id"] = caller_agent_id
-    if receiver_agent_id:
-        body["receiver_agent_id"] = receiver_agent_id
     return await _post("/review", body, include_agent_key=True)
 
-
-@mcp.tool()
-async def open_transaction(
-    receiver_agent_id: str,
-    caller_agent_id:   Optional[str] = None,
-) -> dict:
-    """
-    Mint a transaction handle for a direct (non-proxied) interaction.
-
-    Use this when your agent transacts with another agent peer-to-peer (without
-    routing through call_agent). Open a handle, transact directly, then call
-    review_transaction with the returned transaction_id.
-
-    receiver_agent_id — the agent you are transacting with (must be registered)
-    caller_agent_id   — your agent's ID (required later to auto-fill review)
-
-    Auth (required when caller_agent_id is provided):
-      Set AIDRESS_AGENT_KEY env var before starting the server, or call
-      set_agent_key("<key>") once in-session after registering, or configure
-      AIDRESS_KEYPAIR_PATH for Ed25519 HTTP Message Signatures (RFC 9421).
-      Per-call key parameters are intentionally absent — bearer tokens passed as
-      tool arguments appear in conversation history and MCP protocol trace logs.
-
-    Returns a transaction_id handle to pass to review_transaction.
-    """
-    body: dict = {"receiver_agent_id": receiver_agent_id}
-    if caller_agent_id:
-        body["caller_agent_id"] = caller_agent_id
-    return await _post("/transaction/open", body, include_agent_key=True)
 
 
 # ── Tools: Org Management ───────────────────────────────────────────────────

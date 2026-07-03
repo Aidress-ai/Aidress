@@ -57,7 +57,7 @@ Or add directly to your MCP config:
 }
 ```
 
-12 tools: `verify_agent`, `match_agents`, `get_agent`, `list_registry`, `register_agent`, `update_agent`, `import_agent`, `set_agent_key`, `call_agent`, `open_transaction`, `review_transaction`, `list_org_agents`. See [README_MCP.md](README_MCP.md) for setup.
+11 tools: `verify_agent`, `match_agents`, `get_agent`, `list_registry`, `register_agent`, `update_agent`, `import_agent`, `set_agent_key`, `call_agent`, `review_transaction`, `list_org_agents`. See [README_MCP.md](README_MCP.md) for setup.
 
 ---
 

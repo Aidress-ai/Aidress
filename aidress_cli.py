@@ -12,7 +12,7 @@
 #     python3 aidress_cli.py --url http://localhost:8000 verify agent_freightbot_01
 #
 # Read-only commands (verify, match, get, registry, import) need no auth.
-# Write commands (register, open, call, review) need a bearer key — pass --key
+# Write commands (register, call, review) need a bearer key — pass --key
 # or set AIDRESS_AGENT_KEY; register() prints a fresh key you can reuse.
 #
 # Exit codes: 0 on success, 1 when the response carries an "error" key or the
@@ -83,15 +83,27 @@ def _cmd_import(client: AidressClient, args) -> int:
 
 def _cmd_register(client: AidressClient, args) -> int:
     """Register a new agent; on success the response includes a bearer key."""
+    caps = args.capabilities.split(",") if args.capabilities else None
+    http_methods = args.http_methods.split(",") if args.http_methods else None
+    act = args.accepted_content_types.split(",") if args.accepted_content_types else None
     return _emit(client, client.register(
-        args.agent_id, args.org_name, args.org_domain, args.contact_info,
-    ))
-
-
-def _cmd_open(client: AidressClient, args) -> int:
-    """Mint a transaction handle for a direct, non-proxied interaction."""
-    return _emit(client, client.open_transaction(
-        args.receiver_agent_id, caller_agent_id=args.caller,
+        args.agent_id,
+        org_name=args.org_name,
+        org_domain=args.org_domain,
+        contact_info=args.contact_info,
+        capabilities=caps,
+        endpoint_url=args.endpoint_url,
+        protocol=args.protocol,
+        accepted_terms_format=args.accepted_terms_format,
+        settlement_rail=args.settlement_rail,
+        http_methods=http_methods,
+        specialty=args.specialty,
+        public_key=args.public_key,
+        message_protocol=args.message_protocol,
+        a2a_compliant=args.a2a_compliant,
+        accepted_content_types=act,
+        signup_help=args.signup_help,
+        auth_header_name=args.auth_header_name,
     ))
 
 
@@ -176,25 +188,39 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("domain_url")
     p.set_defaults(func=_cmd_import)
 
-    # register <agent_id> <org_name> <org_domain> <contact_info>
+    # register <agent_id> [options]
     p = sub.add_parser("register", help="register a new agent (returns a bearer key)")
     p.add_argument("agent_id")
-    p.add_argument("org_name")
-    p.add_argument("org_domain")
-    p.add_argument("contact_info", help="any contact channel: email, Twitter, GitHub URL, etc.")
+    p.add_argument("--org-name",               dest="org_name",               default=None)
+    p.add_argument("--org-domain",             dest="org_domain",             default=None)
+    p.add_argument("--contact-info",           dest="contact_info",           default=None, help="email, Twitter, GitHub URL, etc.")
+    p.add_argument("--endpoint-url",           dest="endpoint_url",           default=None, help="HTTPS URL of this agent's endpoint")
+    p.add_argument("--capabilities",           dest="capabilities",           default=None,
+                   help=(
+                       "comma-separated capability names (plain strings default to weight 1). "
+                       "Weight tiers: weight 1 (most specific) max 1, weight 2 max 2, weight 3 (most generic) max 3. "
+                       "Max 6 total. To set a weight pass a JSON dict per item, e.g. "
+                       "'{\"name\":\"freight_booking\",\"weight\":3}'"
+                   ))
+    p.add_argument("--specialty",              dest="specialty",              default=None, help="free-text description of what the agent specialises in")
+    p.add_argument("--settlement-rail",        dest="settlement_rail",        default=None, choices=["x402", "stripe", "manual"])
+    p.add_argument("--protocol",               dest="protocol",               default=None)
+    p.add_argument("--accepted-terms-format",  dest="accepted_terms_format",  default=None)
+    p.add_argument("--http-methods",           dest="http_methods",           default=None, help="comma-separated, e.g. GET,POST")
+    p.add_argument("--message-protocol",       dest="message_protocol",       default="a2a", choices=["a2a", "mcp", "raw"])
+    p.add_argument("--a2a-compliant",          dest="a2a_compliant",          action="store_true", default=False)
+    p.add_argument("--accepted-content-types", dest="accepted_content_types", default=None, help="comma-separated MIME types")
+    p.add_argument("--public-key",             dest="public_key",             default=None, help="Ed25519 public key (base64url)")
+    p.add_argument("--signup-help",            dest="signup_help",            default=None, help="URL/instructions for callers to obtain a credential")
+    p.add_argument("--auth-header-name",       dest="auth_header_name",       default=None, help="header name for per-caller credentials, e.g. X-Api-Key")
     p.set_defaults(func=_cmd_register)
-
-    # open <receiver_agent_id> [--as caller]  (write — needs key)
-    p = sub.add_parser("open", help="mint a transaction handle for a direct interaction")
-    p.add_argument("receiver_agent_id")
-    p.add_argument("--as", dest="caller", default=None, help="your agent_id (the caller)")
-    p.set_defaults(func=_cmd_open)
 
     # call <agent_id> <payload-json> [--as caller] [--x-payment]  (write — needs key)
     p = sub.add_parser("call", help="proxy a JSON payload to an agent through Aidress")
     p.add_argument("agent_id")
     p.add_argument("payload", help="JSON payload string, e.g. '{\"action\":\"book\"}'")
-    p.add_argument("--as", dest="caller", default=None, help="your agent_id (the caller)")
+    p.add_argument("--as", dest="caller", required=True,
+                   help="REQUIRED — your agent_id (the caller); must match your configured agent key")
     p.add_argument("--x-payment", dest="x_payment", default=None,
                    help="X-Payment proof header value for the x402 retry flow")
     p.set_defaults(func=_cmd_call)
