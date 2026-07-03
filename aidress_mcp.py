@@ -42,6 +42,11 @@
 #                         generate_keypair() in aidress_sdk.py. When set, mutating
 #                         tool calls are HTTP-Message-Signed instead of bearer-authed.
 #                         If AIDRESS_AGENT_KEY is also set, bearer takes priority.
+# Payment note: Aidress facilitates payments but never holds, signs, or moves funds.
+# This MCP does NOT take a wallet key. When a counterpart demands payment (402),
+# call_agent returns the transparent /pay proxy URL; you drive your own wallet client
+# against it so the payment routes THROUGH Aidress (tracked) without Aidress ever
+# touching the money. See call_agent's docstring for the flow.
 
 from __future__ import annotations
 
@@ -108,7 +113,80 @@ _transport_security = TransportSecuritySettings(
     allowed_origins=["https://api.aidress.ai", "http://127.0.0.1:*", "http://localhost:*"],
 )
 
-mcp = FastMCP("Aidress", host="0.0.0.0", transport_security=_transport_security)
+# Server-level engagement protocol. The MCP spec surfaces `instructions` to the client
+# at initialize, so this guidance is in front of the agent BEFORE it calls any tool —
+# the right place for cross-cutting rules that no single tool docstring owns. Keep it
+# tight and imperative: it exists to stop agents from transacting blind, skipping the
+# mandatory review, inventing transaction IDs, or otherwise breaking Aidress's mechanics.
+_AIDRESS_INSTRUCTIONS = """\
+Aidress is a trust registry for autonomous AI agents — verify an unknown counterpart
+before you transact with it, then report the outcome so the network stays accurate.
+
+THE STANDARD FLOW (follow it in order):
+  1. DISCOVER  — find counterparts with match_agents (by capability) or list_registry.
+  2. VERIFY    — ALWAYS call verify_agent on a counterpart before transacting. Never
+                 transact with an agent you have not verified, even if it appeared in
+                 match_agents or list_registry results — neither applies any trust or
+                 verified gate, so both can return unverified and low-trust agents
+                 (the only filter is a routable endpoint).
+  3. DECIDE    — act on the trust_score and flags from verify_agent:
+                   0          unregistered → DO NOT transact.
+                   1–49       not trusted (40 = pending review) → DO NOT transact.
+                   50–69      caution → proceed ONLY with safeguards (cap value, use
+                              escrow/staged delivery, or get human sign-off).
+                   70–100     trusted → proceed.
+                 Any entry in `flags` is a warning — investigate before proceeding,
+                 regardless of score.
+  4. TRANSACT  — route the interaction through call_agent (it logs the call, hides the
+                 endpoint, and handles payment/settlement). For a direct peer-to-peer
+                 interaction not proxied by Aidress, mint a handle with open_transaction
+                 FIRST, then transact.
+  5. REVIEW    — MANDATORY. After every call_agent / open_transaction, submit
+                 review_transaction within 24h using the transaction_id you were given.
+                 Missing this costs the caller 5 trust points — waived only if your org has
+                 already used up its 20% rating cap on that receiver (see below). Report the
+                 outcome truthfully (honest success flag + 1–10 score) — accurate signals are
+                 the whole point; gaming is blocked and penalised.
+
+RULES THAT PREVENT COMMON MISTAKES:
+  • Use the server-minted transaction_id returned by call_agent / open_transaction.
+    Do NOT invent your own ID — reviews are keyed to it.
+  • One review per transaction_id. You cannot review yourself, cannot review an agent
+    in your own org domain (collusion block), and your own trust_score must be >= 50 to
+    submit reviews.
+  • No single org can contribute more than 20% of any agent's rating influence (an
+    equal 1/n share until there are 5+ rating orgs). Once your org is at that cap on a
+    given receiver, further same-org reviews add nothing — and the 24h missed-review
+    penalty is waived for calls to that receiver, since the review would be discarded.
+  • If you pass caller_agent_id to call_agent you MUST be authenticated (bearer agent key
+    via set_agent_key, or a configured keypair). Anonymous calls (no caller_agent_id) get
+    no attribution and no review credit. Prefer authenticated calls for accountability.
+  • Registration: one agent per org_domain. If register_agent returns status
+    "capability_confirmation_required" (202), resubmit with capability_confirmations to
+    confirm/reject the suggested canonical names. Save the agent_key from registration —
+    it is shown once and never again.
+
+ENGAGING EXTERNAL COUNTERPARTS CORRECTLY:
+  • Stay within what the counterpart advertises — only request capabilities it lists, and
+    settle only on a settlement_rail it accepts.
+  • If a counterpart demands payment (HTTP 402), call_agent returns a `payment` object
+    with a `pay_via` URL — Aidress's transparent /pay proxy for that agent. To pay:
+    call make_http_request_with_x402 (or equivalent x402 wallet tool) pointed at pay_via
+    as a SINGLE call — do NOT call a separate discover/requirements tool first.
+    Calling discover separately burns the server's one-time nonce; the subsequent payment
+    attempt will be rejected even though the wallet signed correctly. Let the wallet tool
+    do its own discovery internally in one round-trip. NEVER point your wallet at the
+    agent's real endpoint — always use pay_via so the transaction is tracked by Aidress.
+  • Treat verify_agent as a pre-flight check on EVERY new counterpart and before any
+    high-value action with an existing one — trust changes over time.
+"""
+
+mcp = FastMCP(
+    "Aidress",
+    host="0.0.0.0",
+    transport_security=_transport_security,
+    instructions=_AIDRESS_INSTRUCTIONS,
+)
 
 # ── Internal transport layer ─────────────────────────────────────────────────
 # When mounted inside the FastAPI process (remote mode), tools call the ASGI app
@@ -177,7 +255,7 @@ def _headers(include_api_key: bool = False, include_agent_key: bool = False) -> 
     return h
 
 
-async def _post(path: str, body: dict, include_api_key: bool = False, include_agent_key: bool = False) -> dict | list:
+async def _post(path: str, body: dict, include_api_key: bool = False, include_agent_key: bool = False, extra_headers: dict | None = None) -> dict | list:
     """POST to the Aidress API — in-process if mounted, over network if standalone.
 
     When include_agent_key=True: bearer key takes priority; falls back to HTTP sig if
@@ -185,6 +263,8 @@ async def _post(path: str, body: dict, include_api_key: bool = False, include_ag
     """
     try:
         h = _headers(include_api_key, include_agent_key)
+        if extra_headers:
+            h.update(extra_headers)
         # Pre-serialize when signing so the digest covers exactly the bytes the server receives.
         # httpx re-serializes json= independently, so we must pass content= instead.
         effective_agent_key = AGENT_KEY or _session_agent_key
@@ -257,8 +337,12 @@ async def match_agents(
     settlement_rail: Optional[str] = None,
 ) -> list:
     """
-    Find verified agents (trust_score >= 50) that can handle the requested
-    capabilities, ranked by a composite score (capability match + trust + success rate).
+    Find agents that can handle the requested capabilities, ranked by a composite
+    score (capability match + trust + success rate).
+
+    match applies NO trust or verified gate — results can include unverified and
+    low-trust agents, and an agent needs only ONE matching capability to appear.
+    ALWAYS call verify_agent on a result before transacting.
 
     capabilities    — list of capability names, e.g. ["freight_booking", "customs_clearance"]
     settlement_rail — optional filter: "x402", "stripe", "manual", or omit for any
@@ -291,8 +375,10 @@ async def get_agent(agent_id: str) -> dict:
 @mcp.tool()
 async def list_registry(limit: int = 50, offset: int = 0) -> list:
     """
-    Browse all verified and trusted agents in the Aidress registry
-    (trust_score >= 50), paginated.
+    Browse all agents in the Aidress registry, paginated. Discovery is open —
+    there is NO trust or verified gate (the only filter is a routable endpoint),
+    so results can include unverified and low-trust agents. Always call
+    verify_agent before transacting.
 
     limit   — number of agents to return (max 200, default 50)
     offset  — skip this many agents for pagination (default 0)
@@ -329,40 +415,86 @@ async def import_agent(domain_url: str) -> dict:
 
 @mcp.tool()
 async def register_agent(
-    agent_id:               str,
-    org_name:               str,
-    org_domain:             str,
-    contact_email:          str,
-    capabilities:           Optional[list[dict]] = None,
-    endpoint_url:           Optional[str]        = None,
-    protocol:               Optional[str]        = None,
-    settlement_rail:        Optional[str]        = None,
-    specialty:              Optional[str]        = None,
-    accepted_terms_format:  Optional[str]        = None,
-    a2a_compliant:          Optional[bool]       = None,
-    accepted_content_types: Optional[list[str]]  = None,
-    payload_schema:         Optional[dict]       = None,
+    agent_id:                str,
+    org_name:                Optional[str]        = None,
+    org_domain:              Optional[str]        = None,
+    contact_info:            Optional[str]        = None,
+    capabilities:            Optional[list[dict]] = None,
+    endpoint_url:            Optional[str]        = None,
+    protocol:                Optional[str]        = None,
+    settlement_rail:         Optional[str]        = None,
+    specialty:               Optional[str]        = None,
+    accepted_terms_format:   Optional[str]        = None,
+    message_protocol:        Optional[str]        = None,
+    signup_help:             Optional[str]        = None,
+    auth_header_name:        Optional[str]        = None,
+    a2a_compliant:           Optional[bool]       = None,
+    accepted_content_types:  Optional[list[str]]  = None,
+    payload_schema:          Optional[dict]       = None,
+    capability_confirmations: Optional[dict]      = None,
+    candidate_matches:       Optional[dict]       = None,
+    http_methods:            Optional[list[str]]  = None,
 ) -> dict:
     """
-    Register a new AI agent with the Aidress trust registry.
+    Register a new AI agent (or human) with the Aidress trust registry.
 
     Required:
       agent_id       — unique identifier for this agent (e.g. "my_agent_01")
-      org_name       — your organisation name (e.g. "Acme Corp")
-      org_domain     — your domain (e.g. "acme.com") — one agent per domain
-      contact_email  — contact email for this agent
+
+    Conditionally required:
+      org_name       — your organisation name (e.g. "Acme Corp"). Required when
+                       endpoint_url is provided (i.e. you are registering an agent,
+                       not a human). Optional for humans registering as demand-side
+                       participants with no endpoint.
+      org_domain     — your domain (e.g. "acme.com") — one agent per domain.
+                       Required when endpoint_url is provided; optional otherwise.
 
     Optional:
+      contact_info           — any contact channel: email address, Twitter/X handle,
+                               GitHub URL, Telegram, etc. (e.g. "ops@acme.com" or
+                               "@acme_agent" or "https://github.com/acme"). Not
+                               restricted to email — use whatever channel is most
+                               relevant.
       capabilities           — list of capabilities. Each can be a plain string like
                                "freight_booking" or a dict with name and weight like
                                {"name": "freight_booking", "weight": 2}. Weight defaults
                                to 1. Max 1 capability at weight >= 3, max 2 at weight 2.
-      endpoint_url           — HTTPS URL where this agent accepts /call requests
+      endpoint_url           — HTTPS URL where this agent accepts /call requests.
+                               Omit entirely if registering a human (demand-side only).
       protocol               — "REST", "GraphQL", or "gRPC"
-      settlement_rail        — "x402", "stripe", or "manual"
+      settlement_rail        — "x402", "stripe", or "manual". Set to "x402" if you want
+                               callers to be able to pay you at /call time.
       specialty              — free-text description of what this agent does
       accepted_terms_format  — "JSON" or "XML"
-      a2a_compliant          — True if the endpoint speaks the A2A JSON-RPC envelope format
+      http_methods           — HTTP methods the endpoint accepts: ["GET"], ["POST"], or
+                               ["GET", "POST"]. Defaults to ["POST"] if omitted. Use
+                               ["GET"] for read-only lookup agents (price checks, status
+                               queries). Aidress flattens the payload to query params
+                               automatically for GET agents.
+      message_protocol       — the message format your endpoint speaks, and how callers must
+                               shape their call_agent payload to reach you. One of:
+                                 "a2a" (default) — you accept the A2A JSON-RPC envelope; callers
+                                                   pass a payload dict and Aidress wraps it.
+                                 "mcp"           — you are an MCP server; callers send an MCP
+                                                   JSON-RPC message (tools/call, …) forwarded
+                                                   to you verbatim.
+                                 "raw"           — no fixed format; callers send exactly the body
+                                                   your own docs specify, forwarded verbatim.
+      signup_help            — Set this ONLY if calling your endpoint requires the CALLER to
+                               supply its own third-party credential (e.g. your endpoint is a
+                               metered API like a flight or search API where each caller must
+                               use their own API key so quota is charged per caller, not to a
+                               shared key). Provide a link and/or short instructions telling a
+                               caller how to obtain their own credential, e.g.
+                               "Sign up at https://ignav.com to get a free API key."
+                               Leave unset if your endpoint needs no per-caller credential.
+      auth_header_name       — The header name a caller must use to send that credential, e.g.
+                               "X-Api-Key" or "Authorization" (for a bearer token, the caller
+                               sends the full value "Bearer <token>"). The caller places it under
+                               this name inside call_agent's forwarded_headers. Set alongside
+                               signup_help.
+      a2a_compliant          — True if the endpoint speaks the A2A JSON-RPC envelope format.
+                               Only consulted when message_protocol is "a2a".
       accepted_content_types — MIME types the endpoint accepts, e.g. ["application/json"].
                                Defaults to ["text/plain", "application/json"] if omitted.
       payload_schema         — semantic conventions for this agent's payloads. Dict with any
@@ -371,19 +503,51 @@ async def register_agent(
                                Callers will see this before sending a payload so they can
                                format it correctly.
 
+    ── Capability confirmation flow (two-step registration) ─────────────────────
+    When Aidress already has a canonical capability close to one you submitted,
+    it pauses registration and asks you to confirm the rename before proceeding.
+
+    Step 1 — initial call (no confirmation fields):
+      Response HTTP 202, status "capability_confirmation_required"
+      {
+        "status": "capability_confirmation_required",
+        "candidate_matches": {
+          "shoe_sales":   "shoe_selling",   ← your raw name → suggested canonical
+          "fast_deliver": "express_delivery"
+        }
+      }
+
+    Step 2 — re-call with the same fields plus:
+      capability_confirmations — map each raw capability name to True (accept the
+                                 suggested canonical) or False (keep your raw name
+                                 as a new capability):
+                                 {"shoe_sales": True, "fast_deliver": False}
+                                   True  → registered as "shoe_selling"
+                                   False → registered as "fast_deliver" (new entry)
+      candidate_matches        — echo the candidate_matches dict from the 202
+                                 response verbatim so the server can reuse the LLM
+                                 suggestion without re-querying (non-deterministic).
+
+    Full step-2 example:
+      register_agent(
+        agent_id="my_agent_01", org_name="Acme", org_domain="acme.com",
+        contact_info="ops@acme.com",
+        capabilities=["shoe_sales", "fast_deliver"],
+        capability_confirmations={"shoe_sales": True, "fast_deliver": False},
+        candidate_matches={"shoe_sales": "shoe_selling"},
+      )
+    ─────────────────────────────────────────────────────────────────────────────
+
     If AIDRESS_API_KEY is set and valid, the agent is auto-verified at
     trust_score=70. Otherwise it starts at 40 (pending review).
-
-    If the API returns a 202 with candidate_matches, it means some capabilities
-    matched existing taxonomy entries. Re-call register_agent with the same
-    fields plus capability_confirmations to confirm or reject the suggestions.
     """
-    body: dict = {
-        "agent_id":      agent_id,
-        "org_name":      org_name,
-        "org_domain":    org_domain,
-        "contact_email": contact_email,
-    }
+    body: dict = {"agent_id": agent_id}
+    if org_name is not None:
+        body["org_name"] = org_name
+    if org_domain is not None:
+        body["org_domain"] = org_domain
+    if contact_info is not None:
+        body["contact_info"] = contact_info
     if capabilities:
         body["capabilities"] = capabilities
     if endpoint_url:
@@ -396,12 +560,24 @@ async def register_agent(
         body["specialty"] = specialty
     if accepted_terms_format:
         body["accepted_terms_format"] = accepted_terms_format
+    if message_protocol:
+        body["message_protocol"] = message_protocol
+    if signup_help is not None:
+        body["signup_help"] = signup_help
+    if auth_header_name is not None:
+        body["auth_header_name"] = auth_header_name
     if a2a_compliant is not None:
         body["a2a_compliant"] = a2a_compliant
     if accepted_content_types:
         body["accepted_content_types"] = accepted_content_types
     if payload_schema:
         body["payload_schema"] = payload_schema
+    if capability_confirmations is not None:
+        body["capability_confirmations"] = capability_confirmations
+    if candidate_matches is not None:
+        body["candidate_matches"] = candidate_matches
+    if http_methods is not None:
+        body["http_methods"] = http_methods
 
     return await _post("/register", body, include_api_key=True)
 
@@ -411,7 +587,7 @@ async def update_agent(
     agent_id:               str,
     org_name:               Optional[str]       = None,
     org_domain:             Optional[str]       = None,
-    contact_email:          Optional[str]       = None,
+    contact_info:           Optional[str]       = None,
     capabilities:           Optional[list[dict]] = None,
     specialty:              Optional[str]       = None,
     endpoint_url:           Optional[str]       = None,
@@ -419,8 +595,12 @@ async def update_agent(
     accepted_terms_format:  Optional[str]       = None,
     settlement_rail:        Optional[str]       = None,
     payload_schema:         Optional[dict]      = None,
+    message_protocol:       Optional[str]       = None,
+    signup_help:            Optional[str]       = None,
+    auth_header_name:       Optional[str]       = None,
     a2a_compliant:          Optional[bool]      = None,
     accepted_content_types: Optional[list[str]] = None,
+    http_methods:           Optional[list[str]] = None,
 ) -> dict:
     """
     Update an existing agent's profile fields. Only provided fields are changed;
@@ -437,9 +617,10 @@ async def update_agent(
     agent_id       — the agent to update (cannot be changed)
 
     Updatable fields:
-      org_name, org_domain, contact_email, specialty, endpoint_url,
+      org_name, org_domain, contact_info, specialty, endpoint_url,
       protocol, accepted_terms_format, settlement_rail, capabilities,
-      payload_schema, a2a_compliant, accepted_content_types
+      payload_schema, message_protocol, signup_help, auth_header_name,
+      a2a_compliant, accepted_content_types, http_methods
 
     capabilities accepts the same format as register_agent — plain strings
     or {"name": "...", "weight": N} dicts.
@@ -448,6 +629,13 @@ async def update_agent(
                              of: currency (e.g. "USD"), date_format (e.g. "ISO8601"),
                              quantity_unit (e.g. "individual_items"), weight_unit (e.g. "kg").
                              Only these four keys are accepted; unknown keys return 422.
+    message_protocol       — message format the endpoint speaks: "a2a" (default), "mcp", or
+                             "raw". Determines how callers must shape their call_agent payload
+                             (see register_agent for the full description).
+    signup_help            — link/instructions for callers to obtain their own credential, if
+                             your endpoint requires one (see register_agent for details).
+    auth_header_name       — header name callers use to send that credential inside
+                             forwarded_headers (e.g. "X-Api-Key", "Authorization").
     a2a_compliant          — True if the endpoint speaks the A2A JSON-RPC envelope format
     accepted_content_types — MIME types the endpoint accepts, e.g. ["application/json"]
 
@@ -458,8 +646,8 @@ async def update_agent(
         body["org_name"] = org_name
     if org_domain is not None:
         body["org_domain"] = org_domain
-    if contact_email is not None:
-        body["contact_email"] = contact_email
+    if contact_info is not None:
+        body["contact_info"] = contact_info
     if capabilities is not None:
         body["capabilities"] = capabilities
     if specialty is not None:
@@ -474,10 +662,18 @@ async def update_agent(
         body["settlement_rail"] = settlement_rail
     if payload_schema is not None:
         body["payload_schema"] = payload_schema
+    if message_protocol is not None:
+        body["message_protocol"] = message_protocol
+    if signup_help is not None:
+        body["signup_help"] = signup_help
+    if auth_header_name is not None:
+        body["auth_header_name"] = auth_header_name
     if a2a_compliant is not None:
         body["a2a_compliant"] = a2a_compliant
     if accepted_content_types is not None:
         body["accepted_content_types"] = accepted_content_types
+    if http_methods is not None:
+        body["http_methods"] = http_methods
 
     return await _post("/update", body, include_api_key=True, include_agent_key=True)
 
@@ -525,27 +721,83 @@ async def set_agent_key(agent_key: str) -> dict:
 
 # ── Tools: Transactions & Reviews ───────────────────────────────────────────
 
+
 @mcp.tool()
 async def call_agent(
-    agent_id:        str,
-    payload:         dict,
-    caller_agent_id: Optional[str] = None,
+    agent_id:          str,
+    payload:           dict,
+    caller_agent_id:   Optional[str] = None,
+    x_payment:         Optional[str] = None,
+    message_protocol:  Optional[str] = None,
+    mcp_session_id:    Optional[str] = None,
+    forwarded_headers: Optional[dict] = None,
 ) -> dict:
     """
     Send a request to a registered agent through the Aidress proxy.
 
-    All calls are logged — callers that don't submit a review within 24h
-    receive a trust score penalty. Use review_transaction after each call.
+    All calls are logged. Only submit a review when the response includes a
+    review_reminder field — this indicates payment was confirmed and a service
+    exchange occurred. Not all calls result in a settled transaction.
 
-    The response includes a transaction_id handle — pass it to review_transaction
-    instead of inventing your own ID.
+    When review_reminder is present, pass the transaction_id from it to
+    review_transaction to record the outcome.
 
     agent_id        — the agent to call
-    payload         — Your business data as a plain dict, e.g. {"task": "book_shipment", "from": "SIN"}.
-                      This tool wraps it automatically in a DataPart inside the A2A JSON-RPC 2.0
-                      envelope — no envelope construction required on your side.
+    message_protocol — the target's message format, from its trust object (verify_agent /
+                      match_agents return `message_protocol`). Controls how `payload` is shaped:
+                        "a2a" (default) — payload is your business data as a plain dict; this tool
+                                          wraps it in a DataPart inside the A2A JSON-RPC envelope.
+                        "mcp"           — payload IS a complete MCP JSON-RPC message and is sent
+                                          verbatim, e.g.
+                                          {"jsonrpc":"2.0","id":1,"method":"tools/call",
+                                           "params":{"name":"<tool>","arguments":{...}}}
+                        "raw"           — payload is the exact body the target's docs specify; sent
+                                          verbatim with no wrapping.
+                      Always pass the value you saw on the agent's trust object; if unsure, verify
+                      the agent first. Mis-declaring it returns 422 from /call.
+    mcp_session_id  — MCP session token, only for message_protocol="mcp". See the handshake
+                      note below; leave unset otherwise.
+    forwarded_headers — headers relayed VERBATIM to the target, for targets that require the
+                      CALLER's OWN third-party credential (so the target meters usage against
+                      YOUR quota, not a shared Aidress key). Check the agent's trust object
+                      first (verify_agent / match_agents): if it has a `signup_help`, you must
+                      obtain your own credential from there, then send it here under the header
+                      name in `auth_header_name`. Example:
+                        # trust object → signup_help="https://ignav.com...", auth_header_name="X-Api-Key"
+                        call_agent(agent_id, payload={...},
+                                   forwarded_headers={"X-Api-Key": "<your own key>"})
+                      For a bearer target (auth_header_name="Authorization") send the full value:
+                        forwarded_headers={"Authorization": "Bearer <your token>"}
+                      If a call returns 401/403 and the agent has signup_help, that's the signal
+                      to go get your own credential and retry with it here. Aidress ignores a
+                      reserved set (X-Payment, Mcp-Session-Id, Host, Content-*) — you cannot
+                      override those. Leave unset if the agent declares no signup_help.
+    payload         — For "a2a": your business data as a plain dict, e.g.
+                      {"task": "book_shipment", "from": "SIN"} — wrapped automatically in a DataPart.
+                      For "mcp"/"raw": the exact message described under message_protocol above.
 
-                      ── Raw HTTP structure (if calling POST /call directly) ──────────────────
+                      ── MCP session handshake (message_protocol="mcp") ───────────────────────
+                      Some MCP servers are STATEFUL and require an initialize handshake before
+                      any tool call; stateless ones do not. Always do this two-step flow first:
+
+                        1) Call initialize:
+                             call_agent(agent_id, message_protocol="mcp", payload={
+                               "jsonrpc":"2.0","id":1,"method":"initialize",
+                               "params":{"protocolVersion":"2025-06-18","capabilities":{},
+                                         "clientInfo":{"name":"my-agent","version":"1"}}})
+                           Read `mcp_session_id` from the RESULT.
+                        2) Call the tool, passing that id back (omit if step 1 returned none):
+                             call_agent(agent_id, message_protocol="mcp",
+                                        mcp_session_id="<from step 1>",
+                                        payload={"jsonrpc":"2.0","id":2,"method":"tools/call",
+                                                 "params":{"name":"<tool>","arguments":{...}}})
+
+                      If step 1 returns no mcp_session_id (stateless server), just call the tool
+                      normally without it. The initialize call is a handshake — it mints no
+                      transaction and needs no review.
+                      ─────────────────────────────────────────────────────────────────────────
+
+                      ── Raw HTTP structure (if calling POST /call directly, message_protocol=a2a) ──
                       The /call endpoint requires this nested envelope:
 
                         {
@@ -574,6 +826,35 @@ async def call_agent(
                       Check payload_schema on the agent (via verify_agent or match_agents) before
                       sending — mismatched currency, units, or date formats return 409.
     caller_agent_id — your agent's ID (optional but recommended for accountability)
+    x_payment       — Usually leave this UNSET. It is for advanced manual control: a
+                      base64-encoded x402 PaymentPayload (V2) you have already signed with
+                      your own wallet. When provided it is forwarded verbatim to the
+                      counterpart, which settles it; Aidress observes and records the
+                      result. Most callers instead use the `payment.pay_via` flow below.
+
+                      ── PAYMENT FLOW (Aidress facilitates, never holds funds) ───────────
+                      If the counterpart demands payment (HTTP 402) and you did NOT pass
+                      x_payment, the result includes a `payment` object:
+
+                        {
+                          "required": true,
+                          "pay_via":  "https://api.aidress.ai/pay/<agent_id>",
+                          "how":      "<instructions>",
+                          "payment_required": "<base64 requirements: payTo, amount, asset, network>"
+                        }
+
+                      To pay: point your OWN x402 wallet client at `pay_via` and send the
+                      same payload. `pay_via` is a transparent Aidress proxy to the
+                      counterpart — your wallet runs its normal 402 → sign → retry loop
+                      against it, the counterpart settles the payment on its own rail, and
+                      Aidress records amount + success on the way through. Aidress never
+                      holds, signs, or moves the money; you pay the counterpart directly,
+                      just via a path Aidress can observe.
+
+                      DO NOT point your wallet at the counterpart's real endpoint — only at
+                      `pay_via`. Paying the endpoint directly works but is invisible to
+                      Aidress (no tracking, no transaction record). Rail-agnostic: pay_via
+                      relays whatever rail the counterpart uses (x402 today, others later).
 
     Auth (required only when caller_agent_id is provided):
       Set AIDRESS_AGENT_KEY env var before starting the server, or call
@@ -584,22 +865,63 @@ async def call_agent(
 
     Returns the agent's response with a transaction_id handle and HTTP status code.
     """
-    # Wrap payload in A2AEnvelope (JSON-RPC 2.0 / Google A2A format).
-    # The server's /call expects message: A2AEnvelope — plain dict goes in as a DataPart.
-    message = {
-        "jsonrpc": "2.0",
-        "method":  "message/send",
-        "params":  {
-            "message": {
-                "role":  "user",
-                "parts": [{"kind": "data", "content_type": "application/json", "content": payload}],
-            }
-        },
-    }
+    # Shape `message` per the target's declared protocol. /call validates the result against
+    # the receiver's stored message_protocol, so the shape here must match it.
+    #   a2a → wrap the plain payload in an A2A JSON-RPC envelope (payload becomes a DataPart).
+    #   mcp/raw → the payload is already the exact body; forward it verbatim.
+    _proto = (message_protocol or "a2a").lower()
+    if _proto == "a2a":
+        message = {
+            "jsonrpc": "2.0",
+            "method":  "message/send",
+            "params":  {
+                "message": {
+                    "role":  "user",
+                    "parts": [{"kind": "data", "content_type": "application/json", "content": payload}],
+                }
+            },
+        }
+    else:
+        message = payload
     body: dict = {"agent_id": agent_id, "message": message}
     if caller_agent_id:
         body["caller_agent_id"] = caller_agent_id
-    return await _post("/call", body, include_agent_key=True)
+    if forwarded_headers:
+        body["forwarded_headers"] = forwarded_headers
+
+    # Forward X-Payment (x402 settlement) and Mcp-Session-Id (MCP session token from a prior
+    # initialize handshake) as headers when present; both are relayed to the counterpart.
+    _headers: dict = {}
+    if x_payment:
+        _headers["X-Payment"] = x_payment
+    if mcp_session_id:
+        _headers["Mcp-Session-Id"] = mcp_session_id
+    result = await _post(
+        "/call", body, include_agent_key=True,
+        extra_headers=(_headers or None),
+    )
+
+    # Payment required and the caller didn't pre-sign one. Aidress never holds funds, so
+    # rather than signing here we hand back the transparent /pay proxy URL for this agent.
+    # The caller drives its OWN wallet against pay_via: Aidress relays the sign → retry
+    # loop to the counterpart, the counterpart settles, and Aidress records the outcome.
+    if (not x_payment and isinstance(result, dict)
+            and result.get("status_code") == 402):
+        result["payment"] = {
+            "required": True,
+            "pay_via":  f"{BASE_URL}/pay/{agent_id}",
+            "how": (
+                "Point your x402 wallet client at pay_via and send the same payload. "
+                "The payment routes through Aidress (so it is tracked) while Aidress "
+                "never touches the funds — you pay the counterpart directly via the proxy. "
+                "Do NOT pay the agent's real endpoint directly. After it settles, submit "
+                "review_transaction if you have the transaction_id."
+            ),
+            "payment_required": (result.get("response_headers") or {}).get("payment-required"),
+        }
+        return result
+
+    return result
 
 
 @mcp.tool()
@@ -611,16 +933,18 @@ async def review_transaction(
     receiver_agent_id: Optional[str] = None,
 ) -> dict:
     """
-    Submit a trust review after completing a transaction with another agent.
-    This is mandatory — agents that don't review within 24h are penalised.
+    Submit a trust review after a payment-confirmed transaction with another agent.
+    Only call this when call_agent returned a review_reminder field — that field
+    signals that payment was confirmed and a review is expected. Calls with no
+    payment do not require a review.
 
     When transaction_id is a handle from call_agent or open_transaction, caller and
     receiver are looked up automatically — only transaction_id, success, and score
     are required.
 
-    transaction_id     — the handle returned by call_agent or open_transaction
+    transaction_id     — the handle returned by call_agent (from review_reminder) or open_transaction
     success            — True if the transaction completed successfully
-    score              — trust rating 1 (very poor) to 5 (excellent)
+    score              — trust rating 1 (very poor) to 10 (excellent)
     caller_agent_id    — only needed for bring-your-own transaction IDs
     receiver_agent_id  — only needed for bring-your-own transaction IDs
 
@@ -636,6 +960,8 @@ async def review_transaction(
       - Cannot review your own agent
       - Cannot review agents from the same org domain (collusion block)
       - One review per transaction_id
+      - No single org contributes more than 20% of an agent's rating influence
+        (an equal 1/n share until 5+ rating orgs); reviews beyond that share are capped
 
     Returns the updated trust object for the reviewed agent.
     """

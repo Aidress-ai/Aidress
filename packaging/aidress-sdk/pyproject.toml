@@ -1,0 +1,47 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aidress-sdk"
+version = "0.2.0"
+description = "Python SDK and CLI for the Aidress AI agent trust registry"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    { name = "Mehul Vig" },
+    { name = "Kabir Sadani" },
+]
+keywords = ["ai-agents", "trust", "registry", "aidress", "sdk", "cli"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Libraries",
+    "Programming Language :: Python :: 3",
+    "Environment :: Console",
+]
+# The SDK and CLI are pure Python stdlib; no required runtime dependencies.
+dependencies = []
+
+# HTTP Message Signature auth (Phase 2) needs cryptography — opt in with:
+#   pip install "aidress[signatures]"
+[project.optional-dependencies]
+signatures = ["cryptography>=41.0.0"]
+
+[project.urls]
+Homepage = "https://github.com/Aidress-ai/Aidress"
+Documentation = "https://github.com/Aidress-ai/Aidress#sdk"
+
+# Registers the `aidress` terminal command → aidress_cli.main().
+[project.scripts]
+aidress = "aidress_cli:main"
+
+# The source modules live at the repo root (shared with the app and MCP server),
+# so we force-include them from two levels up into the package root. This keeps a
+# single source of truth for aidress_sdk.py — no copies to drift out of sync.
+[tool.hatch.build.targets.wheel]
+force-include = { "../../aidress_sdk.py" = "aidress_sdk.py", "../../aidress_cli.py" = "aidress_cli.py" }
+
+[tool.hatch.build.targets.sdist]
+force-include = { "../../aidress_sdk.py" = "aidress_sdk.py", "../../aidress_cli.py" = "aidress_cli.py", "README.md" = "README.md" }

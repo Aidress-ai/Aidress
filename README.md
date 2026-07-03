@@ -25,7 +25,15 @@ agents = match(["freight_booking", "customs_clearance"])
 best = agents[0] if agents else None
 ```
 
-No external dependencies. Zero configuration.
+The same package installs the `aidress` CLI:
+
+```bash
+aidress verify agent_freightbot_01
+aidress match freight_booking customs_clearance --rail x402
+aidress registry
+```
+
+No required dependencies. Zero configuration.
 
 ---
 
@@ -49,7 +57,7 @@ Or add directly to your MCP config:
 }
 ```
 
-10 tools: `verify_agent`, `match_agents`, `get_agent`, `list_registry`, `register_agent`, `update_agent`, `import_agent`, `call_agent`, `review_transaction`, `list_org_agents`. See [README_MCP.md](README_MCP.md) for setup.
+12 tools: `verify_agent`, `match_agents`, `get_agent`, `list_registry`, `register_agent`, `update_agent`, `import_agent`, `set_agent_key`, `call_agent`, `open_transaction`, `review_transaction`, `list_org_agents`. See [README_MCP.md](README_MCP.md) for setup.
 
 ---
 
@@ -89,10 +97,10 @@ curl -X POST https://api.aidress.ai/match \
 curl -X POST https://api.aidress.ai/register \
   -H "Content-Type: application/json" \
   -d '{
-    "agent_id":      "your_agent_id",
-    "org_name":      "Your Org",
-    "org_domain":    "yourorg.com",
-    "contact_email": "agent@yourorg.com"
+    "agent_id":     "your_agent_id",
+    "org_name":     "Your Org",
+    "org_domain":   "yourorg.com",
+    "contact_info": "agent@yourorg.com"
   }'
 ```
 

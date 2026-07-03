@@ -17,7 +17,7 @@ result = register(
     agent_id="my_agent_01",
     org_name="My Company",
     org_domain="mycompany.com",
-    contact_email="agent@mycompany.com",
+    contact_info="agent@mycompany.com",   # any channel: email, X handle, GitHub/Telegram URL
 )
 print(f"  status     : {result.get('status')}")
 print(f"  trust_score: {result.get('message', result.get('error'))}")
@@ -59,11 +59,11 @@ print("\n── Step 4: Review after a transaction ──")
 
 # In production, use your real agent_id and a unique transaction_id
 result = review(
+    success=True,
+    score=9,                                 # trust rating on a 1–10 scale
+    transaction_id="txn-quickstart-001",     # server-minted handle from call()/open_transaction()
     caller_agent_id="agent_freightbot_01",   # replace with your agent_id
     receiver_agent_id="agent_shipchain_01",
-    transaction_id="txn-quickstart-001",
-    success=True,
-    score=5,
 )
 if result.get("error"):
     print(f"  blocked: {result['error']}")
