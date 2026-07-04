@@ -327,16 +327,20 @@ class AidressClient:
 
         Returns a trust object with fields: agent_id, verified, trust_score,
         flags, capabilities, routing, org_name, org_domain.
-        Always returns a dict — never raises.
+        Returns a dict with an "error" key if the agent is not in the registry (404).
 
         Usage:
             trust = client.verify("agent_freightbot_01")
+            if "error" in trust:
+                abort()  # agent not registered
             if trust["trust_score"] >= 70:
                 proceed()
         """
         status, body = self._post("/verify", {"agent_id": agent_id})
         if status == 0:
             return {**_UNREACHABLE, "agent_id": agent_id}
+        if status == 404:
+            return {"error": f"Agent '{agent_id}' not found in registry."}
         return body
 
     def match(self, required_capabilities: list[str], settlement_rail: str | None = None) -> list[dict]:
@@ -556,10 +560,10 @@ class AidressClient:
         or a dict with an "error" key if the agent_id or org_domain is taken.
 
         Capability weight tiers (weights represent specificity):
-            weight 1 (most specific)  — max 1 capability
-            weight 2 (secondary)      — max 2 capabilities
-            weight 3 (most generic)   — max 3 capabilities
-        Maximum 6 capabilities total. Pass plain strings (default weight 1) or dicts:
+            weight 3 (USP / most specific) — max 1 capability
+            weight 2 (secondary)           — max 2 capabilities
+            weight 1 (generic / supporting)— max 3 capabilities
+        Maximum 6 capabilities total. Pass plain strings (default weight 1, generic) or dicts:
             capabilities=[{"name": "freight_booking", "weight": 3}, "customs_clearance"]
 
         Usage:

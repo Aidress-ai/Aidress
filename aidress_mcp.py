@@ -130,7 +130,7 @@ THE STANDARD FLOW (follow it in order):
                  verified gate, so both can return unverified and low-trust agents
                  (the only filter is a routable endpoint).
   3. DECIDE    — act on the trust_score and flags from verify_agent:
-                   0          unregistered → DO NOT transact.
+                   404 error  unregistered → DO NOT transact.
                    1–49       not trusted (40 = pending review) → DO NOT transact.
                    50–69      caution → proceed ONLY with safeguards (cap value, use
                               escrow/staged delivery, or get human sign-off).
@@ -316,9 +316,10 @@ async def verify_agent(agent_id: str) -> dict:
     Returns trust_score (0–100), verified status, capabilities, flags,
     routing info, and payload_schema (the semantic conventions the agent
     expects: currency, date_format, quantity_unit, weight_unit).
+    Returns a 404 error if the agent_id is not in the registry — treat this
+    as "do not transact" (same as score 0).
 
     Trust tiers:
-      0        — unregistered → do not transact
       1–49     — not trusted (40 = pending review) → do not transact
       50–69    — caution → proceed only with safeguards
       70–100   — trusted → proceed
@@ -457,11 +458,11 @@ async def register_agent(
                                relevant.
       capabilities           — list of capabilities. Each can be a plain string like
                                "freight_booking" or a dict with name and weight like
-                               {"name": "freight_booking", "weight": 2}. Weight defaults
+                               {"name": "freight_booking", "weight": 3}. Weight defaults
                                to 1. Weights represent specificity tiers:
-                                 weight 1 (most specific)  — max 1 capability
-                                 weight 2 (secondary)      — max 2 capabilities
-                                 weight 3 (most generic)   — max 3 capabilities
+                                 weight 3 (USP / most specific) — max 1 capability
+                                 weight 2 (secondary)           — max 2 capabilities
+                                 weight 1 (generic / supporting)— max 3 capabilities
                                Maximum 6 capabilities total across all tiers.
       endpoint_url           — HTTPS URL where this agent accepts /call requests.
                                Omit entirely if registering a human (demand-side only).
@@ -911,7 +912,12 @@ async def call_agent(
             and result.get("status_code") == 402):
         result["payment"] = {
             "required": True,
-            "pay_via":  f"{BASE_URL}/pay/{agent_id}",
+            # call_ref ties this payment back to THIS authenticated /call so the
+            # settlement inherits the caller_agent_id that /call already verified —
+            # without it, /pay has no trusted caller identity and the exchange can't
+            # be reviewed. Attribution comes from the authenticated call, not a
+            # spoofable query param, so it stays framing-safe.
+            "pay_via":  f"{BASE_URL}/pay/{agent_id}?call_ref={result.get('transaction_id')}",
             "how": (
                 "Point your x402 wallet client at pay_via and send the same payload. "
                 "The payment routes through Aidress (so it is tracked) while Aidress "

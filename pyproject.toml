@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "aidress-mcp"
-version = "0.2.3"
+version = "0.2.5"
 description = "MCP server for the Aidress AI agent trust registry"
 readme = "README_MCP.md"
 license = "MIT"

@@ -197,8 +197,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--endpoint-url",           dest="endpoint_url",           default=None, help="HTTPS URL of this agent's endpoint")
     p.add_argument("--capabilities",           dest="capabilities",           default=None,
                    help=(
-                       "comma-separated capability names (plain strings default to weight 1). "
-                       "Weight tiers: weight 1 (most specific) max 1, weight 2 max 2, weight 3 (most generic) max 3. "
+                       "comma-separated capability names (plain strings default to weight 1, generic). "
+                       "Weight tiers: weight 3 (USP/most specific) max 1, weight 2 max 2, weight 1 (generic) max 3. "
                        "Max 6 total. To set a weight pass a JSON dict per item, e.g. "
                        "'{\"name\":\"freight_booking\",\"weight\":3}'"
                    ))
