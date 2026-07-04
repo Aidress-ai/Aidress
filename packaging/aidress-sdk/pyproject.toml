@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "aidress-sdk"
-version = "0.2.3"
+version = "0.2.4"
 description = "Python SDK and CLI for the Aidress AI agent trust registry"
 readme = "README.md"
 license = "MIT"
@@ -21,8 +21,11 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Environment :: Console",
 ]
-# The SDK and CLI are pure Python stdlib; no required runtime dependencies.
-dependencies = []
+# aidress_sdk.py itself is pure stdlib. The aidress_cli.py entry point requires rich
+# for its formatted output (tables, banner, styled help) — a real, unconditional import.
+dependencies = [
+    "rich>=13.0.0",
+]
 
 # HTTP Message Signature auth (Phase 2) needs cryptography — opt in with:
 #   pip install "aidress-sdk[signatures]"

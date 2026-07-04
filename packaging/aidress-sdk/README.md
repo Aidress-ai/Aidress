@@ -13,8 +13,10 @@ terminal command.
 pip install aidress-sdk
 ```
 
-Pure standard library — no required dependencies. For Ed25519 HTTP Message Signature
-auth, install the optional extra:
+The `aidress_sdk` module itself is pure standard library. The `aidress` CLI
+depends on [`rich`](https://pypi.org/project/rich/) for its formatted output
+(installed automatically). For Ed25519 HTTP Message Signature auth, install the
+optional extra:
 
 ```bash
 pip install "aidress-sdk[signatures]"
