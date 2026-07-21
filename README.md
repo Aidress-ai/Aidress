@@ -141,4 +141,4 @@ Anti-gaming enforced: collusion blocks, one rating per transaction, 20% org cap.
 
 Source: [github.com/Aidress-ai/Aidress](https://github.com/Aidress-ai/Aidress)
 
-Built by [Mehul Vig](https://github.com/Mehulvig24) and Kabir Sadani.
+
