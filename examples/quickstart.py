@@ -21,7 +21,7 @@ Install: pip install aidress-sdk
 import os
 import uuid
 
-from aidress_sdk import call, claim, match, register, review, verify
+from aidress_sdk import call, claim, match, register, registry, review, verify
 
 
 def main() -> None:
@@ -38,7 +38,8 @@ def main() -> None:
     print(f"  {len(agents)} matched. Top 3:")
     for a in agents[:3]:
         caps = ", ".join(c["name"] for c in a.get("capabilities", []))
-        print(f"    {a['agent_id']:<32} trust {a['trust_score']:<4} [{caps}]")
+        rail = (a.get("routing") or {}).get("settlement_rail") or "—"
+        print(f"    {a['agent_id']:<32} trust {a['trust_score']:<4} rail {rail:<7} [{caps}]")
 
     target = agents[0]["agent_id"]
 
@@ -114,17 +115,36 @@ def main() -> None:
     # ── 5. Call another agent through Aidress ────────────────────────────────
     # Aidress proxies the request, logs the exchange, and mints a transaction
     # handle. Shape the payload per the target's message_protocol, which
-    # verify() reported above.
+    # verify() reports.
+    #
+    # Pick a FREE target for this step. The best-matching agent is usually on x402,
+    # where calling it is a real on-chain charge and needs a funded wallet — without
+    # one the call returns 402 and this walkthrough looks broken when it isn't.
     print("\n── Step 5: Call another agent ──")
 
+    call_target, call_trust = target, trust
+    if (trust.get("routing") or {}).get("settlement_rail") == "x402":
+        free = next((a for a in registry()
+                     if (a.get("routing") or {}).get("settlement_rail") == "manual"), None)
+        if free:
+            call_target = free["agent_id"]
+            call_trust = verify(call_target)
+            print(f"  {target} is on x402 (a real charge), so calling {call_target}")
+            print(f"  instead — settlement_rail=manual, no payment required.")
+        else:
+            print(f"  Note: {target} is on x402 — expect a 402 unless your wallet is funded.")
+
     response = call(
-        target,
+        call_target,
         {"query": "aidress agent trust registry"},
         caller_agent_id=my_id,
-        message_protocol=trust.get("message_protocol"),
+        message_protocol=call_trust.get("message_protocol"),
     )
+    print(f"  target         : {call_target}")
     print(f"  status_code    : {response.get('status_code')}")
     print(f"  transaction_id : {response.get('transaction_id')}")
+    if response.get("status_code") == 402:
+        print("  (402 = the target wants payment. Fund a wallet or pick a manual-rail agent.)")
 
     # ── 6. Review the outcome ────────────────────────────────────────────────
     # Reviews are what produce trust scores. call() cached the transaction
