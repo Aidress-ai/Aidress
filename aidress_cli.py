@@ -1075,7 +1075,7 @@ def _build_parser() -> _RichParser:
 # Must track [project].version in packaging/aidress-sdk/pyproject.toml — the CLI ships in
 # that package, so a mismatch makes `aidress --version` lie. release.sh rewrites both.
 # Also keys the once-per-version banner sentinel below, so a bump re-shows the banner.
-_CLI_VERSION = "0.4.0"
+_CLI_VERSION = "0.4.1"
 _SENTINEL = Path.home() / ".aidress" / f".banner_shown_{_CLI_VERSION}"
 
 

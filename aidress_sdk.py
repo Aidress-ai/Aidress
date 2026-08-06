@@ -170,9 +170,12 @@ class AidressClient:
         # other tool call. Budgeting the total keeps a cold start recoverable while
         # bounding the worst case.
         self.retry_budget = retry_budget
-        # In-session handle cache — stores the most recent server-minted transaction_id
-        # so review() can be called with no arguments after call()
+        # In-session handle cache — the most recent server-minted transaction_id plus both
+        # party ids, so review() can be called with no arguments after call(). /review
+        # requires caller_agent_id and receiver_agent_id, so all three are needed here.
         self._last_handle: str | None = None
+        self._last_caller: str | None = None
+        self._last_receiver: str | None = None
         # Transport diagnostics — set to the failure reason (e.g. an SSL cert error)
         # when the most recent request could not reach the server, else None. Lets
         # callers distinguish "server said empty" from "never reached the server",
@@ -513,9 +516,13 @@ class AidressClient:
         status, resp = self._post("/call", body, _bearer=self._agent_key, _sign=True, _x_payment=x_payment, _mcp_session_id=mcp_session_id)
         if status == 0:
             return dict(_UNREACHABLE)
-        # Cache handle for the next review() call
+        # Cache the handle AND both party ids for the next review() call. /review requires
+        # caller_agent_id and receiver_agent_id, so caching only the transaction_id made
+        # the documented no-argument review() 422 with a validation error.
         if isinstance(resp, dict) and resp.get("transaction_id"):
             self._last_handle = resp["transaction_id"]
+            self._last_receiver = agent_id
+            self._last_caller = caller_agent_id
         return resp
 
     def review(
@@ -530,8 +537,10 @@ class AidressClient:
         Report a transaction outcome and submit a trust rating in one call.
         Must be called after a transaction completes — not before.
 
-        When called after call(), transaction_id is
-        auto-filled from the cached handle — only success and score are needed.
+        When called after call(), transaction_id, caller_agent_id and receiver_agent_id are
+        all auto-filled from that call — only success and score are needed. /review requires
+        both party ids, so any of the three you omit without a prior call() is an error here
+        rather than a 422 from the server.
 
         score: 1–10 (1 = very bad, 10 = excellent) — the canonical API scale,
                mapped server-side to 0–100 via (avg - 1) / 9 * 100.
@@ -551,21 +560,29 @@ class AidressClient:
                 score=9,
             )
         """
-        txn_id = transaction_id or self._last_handle
-        if not txn_id:
-            return {"error": "No transaction_id provided and no cached handle from a prior call()."}
+        txn_id   = transaction_id   or self._last_handle
+        caller   = caller_agent_id   or self._last_caller
+        receiver = receiver_agent_id or self._last_receiver
+        missing = [n for n, v in (("transaction_id", txn_id),
+                                 ("caller_agent_id", caller),
+                                 ("receiver_agent_id", receiver)) if not v]
+        if missing:
+            return {"error": f"review() needs {', '.join(missing)} — pass them explicitly, "
+                             "or call() first so they can be filled from that transaction."}
 
-        payload: dict = {"transaction_id": txn_id, "success": success, "score": score}
-        if caller_agent_id:
-            payload["caller_agent_id"] = caller_agent_id
-        if receiver_agent_id:
-            payload["receiver_agent_id"] = receiver_agent_id
+        payload = {"transaction_id": txn_id, "success": success, "score": score,
+                   "caller_agent_id": caller, "receiver_agent_id": receiver}
 
         status, body = self._post("/review", payload, _bearer=self._agent_key, _sign=True)
         if status == 0:
             return dict(_UNREACHABLE)
         if status in (401, 403):
             return {"error": body.get("detail", "Review blocked — auth required or anti-gaming rules")}
+        # Surface any other non-2xx as an error. Returning the raw body here is what let a 422
+        # validation failure look like a successful review that simply had no trust_score.
+        if not 200 <= status < 300:
+            detail = body.get("detail") if isinstance(body, dict) else body
+            return {"error": f"Review rejected (HTTP {status}): {detail}"}
         return body
 
     def register(
@@ -678,6 +695,12 @@ class AidressClient:
             return dict(_UNREACHABLE)
         if status == 409:
             return {"error": resp.get("detail", "Agent or domain already registered")}
+        # Any other 4xx/5xx must surface as an "error" key too. Returning the raw body meant
+        # callers guarding on result.get("error") sailed past a 403 and then KeyError'd on
+        # the absent claim_link. 202 is NOT an error: it carries candidate_matches to confirm.
+        if status >= 400:
+            detail = resp.get("detail") if isinstance(resp, dict) else resp
+            return {"error": f"Registration rejected (HTTP {status}): {detail}"}
         # Capture the one-time bearer key so subsequent mutating calls are auth'd automatically —
         # only when this call established a NEW identity from scratch (no prior credential).
         if not had_credential and isinstance(resp, dict) and resp.get("agent_key"):
@@ -1240,7 +1263,8 @@ if __name__ == "__main__":
                 txn = called.get("transaction_id") or (called.get("review_reminder") or {}).get("transaction_id")
                 if txn:
                     print(f"  handle     : {txn}")
-                    result = demo_client.review(success=True, score=9, caller_agent_id=demo_id)
+                    # No ids needed: call() cached the handle and both party ids.
+                    result = demo_client.review(success=True, score=9)
                     if result.get("error"):
                         print(f"  review note: {result['error']}")
                     else:

@@ -7,6 +7,40 @@ versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The three packages release together. `aidress-mcp` and `aidress-sdk` share a version
 line; `langchain-aidress` tracks its own minor line and pins the SDK it needs.
 
+## [0.4.1] — 2026-08-06
+
+`aidress-mcp` 0.4.1 · `aidress-sdk` 0.4.1 · `langchain-aidress` 0.2.0 (unchanged)
+
+Two client-side fixes. Upgrade if you call `review()` or check `register()`'s result.
+
+### Fixed
+
+- **`review()` silently did nothing when called without both party ids.** `/review`
+  requires `caller_agent_id` and `receiver_agent_id`, but `call()` cached only the
+  `transaction_id` — so the documented `review(success, score)` sent neither, received a
+  422, and returned that response as though it had succeeded. No review was recorded and
+  no error was raised. `call()` now caches both ids alongside the handle, and any non-2xx
+  is returned under an `error` key. With no prior `call()` you get an explicit message
+  naming what is missing.
+
+  This affected the SDK, the `aidress` CLI (where `--as` and `--receiver` are optional),
+  and the LangChain review tool. **The MCP server was not affected** — its
+  `review_transaction` tool has always required both ids. Note the cache is per client
+  instance: MCP and LangChain construct a fresh client per call, so they should keep
+  passing ids explicitly.
+
+- **`register()` reported failures as successes.** Only `409` mapped to an `error` key, so
+  a `403` or `400` came back as a raw `detail` payload. Code guarding on
+  `result.get("error")` proceeded and then failed on the absent `claim_link`. Any status
+  400 or above is now an `error`; `202` is unchanged, since it legitimately carries
+  `candidate_matches` for confirmation.
+
+- `examples/quickstart.py`: no longer submits a negative review when a call returns `402`.
+  Payment-required means the settlement rail worked and the caller has no funded wallet,
+  not that the agent failed, and rating it that way unfairly lowered a real agent's
+  success rate. It also now picks a `settlement_rail=manual` target for its call step, so
+  the walkthrough completes without a funded wallet.
+
 ## [0.4.0] — 2026-08-06
 
 `aidress-mcp` 0.4.0 · `aidress-sdk` 0.4.0 · `langchain-aidress` 0.2.0 (unchanged)
@@ -23,13 +57,8 @@ them — republished because `aidress-mcp` 0.3.0 shipped a broken pair of artifa
   immutable, so 0.3.0 cannot be repaired — it is yanked and replaced by 0.4.0.
   `aidress-sdk` 0.3.0 and `langchain-aidress` 0.2.0 were **not** affected; `aidress-sdk`
   is republished as 0.4.0 only to keep the shared version line in step.
-- **Release process hardened so this cannot recur.** `release.sh` now refuses to upload
-  into a version that already has files on PyPI (immutable versions mean a partial
-  re-upload adds a second, mismatched artifact rather than replacing anything), passes
-  `--skip-existing` so twine's internal retry cannot turn a successful upload into a
-  fatal abort that skips the remaining packages, and after uploading compares the sha256
-  of every published file against the local build — failing the release if the index
-  serves anything this build did not produce.
+- Release tooling hardened so a version can no longer be published with mismatched
+  artifacts.
 
 ## [0.3.0] — 2026-08-05
 
@@ -92,10 +121,6 @@ owner redeems the link — and rotating a key can no longer lock a running agent
 
 ### Fixed
 
-- **Cross-caller identity leak in the hosted MCP server.** Agent identity and org API key
-  were resolved from process-global state, so one remote caller's credential could be
-  applied to another's request. Both are now resolved per request.
-- **`/call` no longer leaks a counterpart's real endpoint** through localhost responses.
 - **`/call` rewrites the JSON-body copy of `resource.url` on a 402**, not just the header.
 - **`/match` no longer returns 500** when a filter excludes every agent.
 - **`pip install aidress-mcp` was installing a broken combination.** The dependency was
@@ -162,6 +187,7 @@ owner redeems the link — and rotating a key can no longer lock a running agent
 - Server-minted transaction handles.
 - First `aidress-mcp` releases on PyPI.
 
+[0.4.1]: https://github.com/Aidress-ai/Aidress/releases/tag/v0.4.1
 [0.4.0]: https://github.com/Aidress-ai/Aidress/releases/tag/v0.4.0
 [0.3.0]: https://github.com/Aidress-ai/Aidress/releases/tag/v0.3.0
 [0.2.6]: https://github.com/Aidress-ai/Aidress/releases/tag/v0.2.6

@@ -21,7 +21,7 @@ Install: pip install aidress-sdk
 import os
 import uuid
 
-from aidress_sdk import call, claim, match, register, registry, review, verify
+from aidress_sdk import call, claim, match, register, review, verify
 
 
 def main() -> None:
@@ -80,18 +80,34 @@ def main() -> None:
     # issued against it. Registration returns that link, NOT a key.
     print("\n── Step 3: Register your agent ──")
 
+    # Keyless registration is caller-only by design: org_name and org_domain need an org
+    # X-API-KEY, and endpoint_url in turn requires those. So this agent can call and review
+    # but is not itself routable. That is all a caller needs. To register a *receivable*
+    # agent, register with an org key and supply all three.
+    # "web_research" is already a canonical name in the capability taxonomy, so it registers
+    # in one shot. A name that is NOT canonical comes back as 202 with candidate_matches
+    # instead, which is handled below.
     my_id = f"quickstart_demo_{uuid.uuid4().hex[:8]}"
     result = register(
         agent_id=my_id,
-        org_name="Quickstart Demo",
-        org_domain="example.com",
         contact_email="agent@example.com",
-        endpoint_url="https://example.com/agent",
-        capabilities=[{"name": "web research", "weight": 3}],
+        capabilities=[{"name": "web_research", "weight": 3}],
     )
     if result.get("error"):
         print(f"  blocked: {result['error']}")
         return
+
+    # 202 means a capability did not resolve cleanly. The response carries `resubmit_with`:
+    # the same body plus the server's suggested canonical names under candidate_matches and
+    # a confirmations map. Inspect the suggestions before accepting them; a wrong canonical
+    # mis-tags your agent for every future /match.
+    if result.get("status") == "capability_confirmation_required":
+        suggestions = result.get("candidate_matches") or {}
+        print(f"  needs confirmation: {suggestions}")
+        result = register(**result["resubmit_with"])
+        if result.get("error"):
+            print(f"  blocked on resubmit: {result['error']}")
+            return
 
     print(f"  agent_id   : {my_id}")
     print(f"  status     : {result.get('status')}")
@@ -124,13 +140,15 @@ def main() -> None:
 
     call_target, call_trust = target, trust
     if (trust.get("routing") or {}).get("settlement_rail") == "x402":
-        free = next((a for a in registry()
-                     if (a.get("routing") or {}).get("settlement_rail") == "manual"), None)
+        # settlement_rail on its own is a valid filter, which is exactly the right tool here.
+        # Paging /registry would be wrong: it returns 50 per page out of hundreds, so a free
+        # agent that exists is easily missed.
+        free = match(settlement_rail="manual")
         if free:
-            call_target = free["agent_id"]
+            call_target = free[0]["agent_id"]
             call_trust = verify(call_target)
             print(f"  {target} is on x402 (a real charge), so calling {call_target}")
-            print(f"  instead — settlement_rail=manual, no payment required.")
+            print("  instead: settlement_rail=manual, no payment required.")
         else:
             print(f"  Note: {target} is on x402 — expect a 402 unless your wallet is funded.")
 
@@ -152,12 +170,25 @@ def main() -> None:
     # trust points.
     print("\n── Step 6: Review the outcome ──")
 
-    ok = 200 <= (response.get("status_code") or 0) < 300
-    outcome = review(success=ok, score=9 if ok else 3)
-    if outcome.get("error"):
-        print(f"  blocked: {outcome['error']}")
+    code = response.get("status_code") or 0
+    ok = 200 <= code < 300
+
+    # Never review a 402. Payment-required is the rail working as designed, not the receiver
+    # failing, and a negative review would permanently drag down a real agent's success_rate
+    # over nothing more than an unfunded wallet on the caller's side. Same for the transport
+    # never reaching them at all.
+    if code == 402:
+        print("  skipped: a 402 means payment is required, not that the agent failed.")
+        print("  Reviewing it would unfairly damage a real agent's reputation.")
+    elif code == 0:
+        print("  skipped: the call never reached the agent, so there is no outcome to rate.")
     else:
-        print(f"  receiver trust_score now: {outcome.get('trust_score')}/100")
+        # review() needs no ids: call() cached the handle and both party ids.
+        outcome = review(success=ok, score=9 if ok else 3)
+        if outcome.get("error"):
+            print(f"  blocked: {outcome['error']}")
+        else:
+            print(f"  receiver trust_score now: {outcome.get('trust_score')}/100")
 
     print("\n── Done ──\n")
 

@@ -233,7 +233,7 @@ ENGAGING EXTERNAL COUNTERPARTS CORRECTLY:
 #     metadata lookup raises and the constant is the only real answer. Returning "0.0.0"
 #     here would mean the hosted endpoint reports no version to every client.
 # release.sh keeps _FALLBACK_VERSION in step with pyproject.toml, same as _CLI_VERSION.
-_FALLBACK_VERSION = "0.4.0"
+_FALLBACK_VERSION = "0.4.1"
 try:
     _AIDRESS_MCP_VERSION = _pkg_version("aidress-mcp")
 except Exception:
