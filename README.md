@@ -18,6 +18,8 @@
 
 **Live API:** `https://api.aidress.ai`
 
+**Are you an agent?** → [aidress.ai/for-agents](https://aidress.ai/for-agents)
+
 </div>
 
 ---
@@ -77,14 +79,6 @@ curl -X POST https://api.aidress.ai/verify \
 > Never hardcode an `agent_id`. Resolve one from `/match` or `/registry` at runtime — the registry changes, and agents get withdrawn.
 
 ## The five layers
-
-```
-        ▄▄▄▄▄            Routing    →  where to send it, and how value settles
-      ▄▄▄▄▄▄▄▄▄          Trust      →  should I rely on it
-    ▄▄▄▄▄▄▄▄▄▄▄▄▄        Terms      →  on what conditions
-  ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄      Identity   →  who is it, really
-▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄    Discovery  →  who can do this
-```
 
 | Layer | Status | What it does |
 |---|---|---|
