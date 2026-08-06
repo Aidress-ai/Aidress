@@ -6,16 +6,36 @@
 # ── Usage ────────────────────────────────────────────────────────────────────
 #
 # Remote (recommended — zero install):
-#   Add to Claude Desktop config (~/.claude/claude_desktop_config.json):
+#   The hosted server is ONE shared process for every remote caller (see
+#   set_asgi_app) — so, unlike local/stdio mode below, do NOT rely on
+#   AIDRESS_AGENT_KEY/AIDRESS_API_KEY env vars or the set_agent_key tool here.
+#   Those would apply to every other caller connected at the same time, not
+#   just you. Instead send your own key as a header on the connection itself,
+#   via mcp-remote (npx mcp-remote), e.g. in Claude Desktop config
+#   (~/Library/Application Support/Claude/claude_desktop_config.json):
 #       {
 #         "mcpServers": {
 #           "aidress": {
-#             "url": "https://api.aidress.ai/mcp/sse"
+#             "command": "npx",
+#             "args": [
+#               "mcp-remote", "https://api.aidress.ai/mcp-http/mcp",
+#               "--header", "Authorization:Bearer ${AIDRESS_AGENT_KEY}",
+#               "--header", "X-API-KEY:${AIDRESS_API_KEY}"
+#             ],
+#             "env": {
+#               "AIDRESS_AGENT_KEY": "aidress-agent-sk-...",
+#               "AIDRESS_API_KEY":   "aidress-sk-live-..."
+#             }
 #           }
 #         }
 #       }
+#   Omit whichever header you don't have — an agent bearer key alone covers
+#   call_agent/review_transaction/update_agent; an org key alone covers
+#   register_agent's auto-verify/rotate_agent_key/update_agent/list_org_agents.
+#   Read per-request via FastMCP Context (_incoming_bearer_key/_incoming_org_key),
+#   never a server-wide setting.
 #
-# Local (for development):
+# Local (for development, single-user only):
 #   1. pip install mcp httpx
 #   2. Add to Claude Desktop config:
 #       {
@@ -31,7 +51,7 @@
 #       }
 #   3. Restart Claude Desktop. Aidress tools appear automatically.
 #
-# ── Environment variables ─────────────────────────────────────────────────────
+# ── Environment variables (local/stdio mode only — see note above for remote) ──
 #   AIDRESS_BASE_URL    — API base URL (default: https://api.aidress.ai)
 #   AIDRESS_API_KEY     — Org API key for register (auto-verify), update, and
 #                         list_org_agents. Leave unset to use public-only tools.
@@ -42,6 +62,7 @@
 #                         generate_keypair() in aidress_sdk.py. When set, mutating
 #                         tool calls are HTTP-Message-Signed instead of bearer-authed.
 #                         If AIDRESS_AGENT_KEY is also set, bearer takes priority.
+#
 # Payment note: Aidress facilitates payments but never holds, signs, or moves funds.
 # This MCP does NOT take a wallet key. When a counterpart demands payment (402),
 # call_agent returns the transparent /pay proxy URL; you drive your own wallet client
@@ -54,10 +75,13 @@ import hashlib
 import json
 import os
 import time
-from typing import Optional
+import urllib.parse
+from typing import Literal, Optional
 
 import httpx
-from mcp.server.fastmcp import FastMCP
+from importlib.metadata import version as _pkg_version
+
+from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -69,6 +93,13 @@ KEYPAIR_PATH = os.environ.get("AIDRESS_KEYPAIR_PATH")  # Ed25519 keypair JSON �
 
 # In-session bearer key set by set_agent_key() — takes effect immediately without
 # restarting the server. Overridden by AGENT_KEY if both are present.
+#
+# NOTE: this is a process-wide global, which is only safe for a local single-user
+# stdio server. The hosted deployment mounts one aidress_mcp process in-process in
+# main.py for every remote client (see set_asgi_app) — for that case, identity must
+# come from _incoming_bearer_key() (the caller's own per-request Authorization header,
+# read via Context) instead, or one remote caller's set_agent_key call would leak into
+# every other concurrent caller's requests.
 _session_agent_key: str | None = None
 
 # Load Ed25519 keypair at module init if AIDRESS_KEYPAIR_PATH is set.
@@ -124,22 +155,25 @@ before you transact with it, then report the outcome so the network stays accura
 
 THE STANDARD FLOW (follow it in order):
   1. DISCOVER  — find counterparts with match_agents (by capability) or list_registry.
-  2. VERIFY    — ALWAYS call verify_agent on a counterpart before transacting. Never
-                 transact with an agent you have not verified, even if it appeared in
-                 match_agents or list_registry results — neither applies any trust or
-                 verified gate, so both can return unverified and low-trust agents
-                 (the only filter is a routable endpoint).
-  3. DECIDE    — act on the trust_score and flags from verify_agent:
+                 Results already include the full trust object (trust_score, verified,
+                 flags) — that's what you decide from, no separate lookup needed. Neither
+                 tool applies a trust/verified gate of its own (only a routable endpoint
+                 is required to appear), so low-trust and unverified agents can be in the
+                 results — the trust fields are what tell you which ones are safe.
+  2. DECIDE    — act on the trust_score and flags already in that result:
                    404 error  unregistered → DO NOT transact.
                    1–49       not trusted (40 = pending review) → DO NOT transact.
                    50–69      caution → proceed ONLY with safeguards (cap value, use
                               escrow/staged delivery, or get human sign-off).
                    70–100     trusted → proceed.
                  Any entry in `flags` is a warning — investigate before proceeding,
-                 regardless of score.
-  4. TRANSACT  — route the interaction through call_agent (it logs the call, hides the
+                 regardless of score. Only call verify_agent separately if you DON'T
+                 already have trust data for this agent_id (e.g. it was named to you
+                 directly rather than found via match_agents/list_registry), or you
+                 want a fresh check before a high-value action on data that may be stale.
+  3. TRANSACT  — route the interaction through call_agent (it logs the call, hides the
                  endpoint, and handles payment/settlement).
-  5. REVIEW    — MANDATORY. After every call_agent, submit
+  4. REVIEW    — MANDATORY. After every call_agent, submit
                  review_transaction within 24h using the transaction_id you were given.
                  Missing this costs the caller 2 trust points — waived if your org (or you,
                  as an unaffiliated agent) has already used up its influence cap on that
@@ -177,14 +211,37 @@ ENGAGING EXTERNAL COUNTERPARTS CORRECTLY:
     attempt will be rejected even though the wallet signed correctly. Let the wallet tool
     do its own discovery internally in one round-trip. NEVER point your wallet at the
     agent's real endpoint — always use pay_via so the transaction is tracked by Aidress.
-  • Treat verify_agent as a pre-flight check on EVERY new counterpart and before any
-    high-value action with an existing one — trust changes over time.
+  • verify_agent is for when you DON'T already have trust data for an agent_id — e.g.
+    it was named to you directly rather than found via match_agents/list_registry — or
+    you want a fresh check before a high-value action on data that may be stale. If you
+    already have it from match_agents/list_registry, decide from that; don't re-fetch it.
 """
 
-mcp = FastMCP(
+# mcp 2.x: `host` and `transport_security` are per-transport concerns, not server-wide,
+# so they moved off this constructor onto run()/sse_app()/streamable_http_app(). The old
+# host="0.0.0.0" was never load-bearing — stdio has no socket, and the hosted transports
+# are mounted into the FastAPI app (see main.py), which owns the bind address.
+# _transport_security is now passed at each mount site instead.
+# mcp 2.x defaults `version` to "" and no longer falls back to the mcp library's own
+# version the way 1.x did, so serverInfo.version would arrive empty at clients. Report
+# the aidress-mcp version instead — more useful to a caller than the transport library's.
+#
+# Two resolution paths because this file runs in two very different places:
+#   - pip-installed (`aidress-mcp` on PyPI): importlib.metadata is authoritative, and can
+#     legitimately differ from the constant below if someone installed an older wheel.
+#   - source checkout (the hosted server on Render): no distribution is installed, so
+#     metadata lookup raises and the constant is the only real answer. Returning "0.0.0"
+#     here would mean the hosted endpoint reports no version to every client.
+# release.sh keeps _FALLBACK_VERSION in step with pyproject.toml, same as _CLI_VERSION.
+_FALLBACK_VERSION = "0.4.0"
+try:
+    _AIDRESS_MCP_VERSION = _pkg_version("aidress-mcp")
+except Exception:
+    _AIDRESS_MCP_VERSION = _FALLBACK_VERSION
+
+mcp = MCPServer(
     "Aidress",
-    host="0.0.0.0",
-    transport_security=_transport_security,
+    version=_AIDRESS_MCP_VERSION,
     instructions=_AIDRESS_INSTRUCTIONS,
 )
 
@@ -195,6 +252,7 @@ mcp = FastMCP(
 # When running standalone (local mode), tools call the API over the network.
 
 _asgi_client: httpx.AsyncClient | None = None
+_standalone_client: httpx.AsyncClient | None = None
 
 
 def set_asgi_app(app) -> None:
@@ -204,6 +262,20 @@ def set_asgi_app(app) -> None:
         transport=httpx.ASGITransport(app=app),
         base_url="http://localhost",
     )
+
+
+def _get_standalone_client() -> httpx.AsyncClient:
+    """Lazily create and reuse one httpx.AsyncClient for standalone/local (stdio) mode,
+    so a real network deployment doesn't pay a fresh TCP+TLS handshake to BASE_URL on
+    every single tool call. Only used when _asgi_client is unset (this file running
+    standalone, not mounted inside main.py) — the hosted path already reuses
+    _asgi_client for the identical reason. Left open for the life of the process;
+    a local stdio server has no request-scoped lifecycle to tie a shutdown to.
+    """
+    global _standalone_client
+    if _standalone_client is None:
+        _standalone_client = httpx.AsyncClient()
+    return _standalone_client
 
 
 def _sign_mcp_request(path: str, body_bytes: bytes) -> dict:
@@ -240,34 +312,92 @@ def _sign_mcp_request(path: str, body_bytes: bytes) -> dict:
     }
 
 
-def _headers(include_api_key: bool = False, include_agent_key: bool = False) -> dict:
+def _incoming_bearer_key(ctx: Optional[Context]) -> Optional[str]:
+    """Read the CALLER's own Authorization: Bearer aidress-agent-sk-... header off the
+    current MCP request, when one exists.
+
+    Only populated on HTTP transports (streamable-http, SSE) — FastMCP attaches the
+    raw Starlette Request to ctx.request_context.request per call. stdio (local,
+    single-user) has no HTTP request, so this always returns None there and callers
+    fall back to AGENT_KEY / _session_agent_key as before.
+
+    This is what actually makes mcp-remote's `--header Authorization:Bearer ...`
+    do something: previously nothing on the server read that header at all, so every
+    remote caller shared the same server-wide identity (AGENT_KEY env var or whichever
+    key someone last passed to set_agent_key).
+    """
+    if ctx is None:
+        return None
+    try:
+        request = ctx.request_context.request
+    except Exception:
+        return None
+    if request is None:
+        return None
+    auth = request.headers.get("authorization")
+    if not auth or not auth.startswith("Bearer aidress-agent-sk-"):
+        return None
+    return auth.removeprefix("Bearer ")
+
+
+def _incoming_org_key(ctx: Optional[Context]) -> Optional[str]:
+    """Read the CALLER's own X-API-KEY header off the current MCP request, when one
+    exists. Same idea and same shared-process problem as _incoming_bearer_key, but for
+    the org key path (register_agent's auto-verify, rotate_agent_key, update_agent's
+    org-key ownership check, list_org_agents): previously only the server-wide
+    AIDRESS_API_KEY env var was ever consulted, so a caller's own org key sent on their
+    MCP connection was silently ignored — and since that env var isn't set on the
+    hosted server, those tools simply failed for everyone rather than using the
+    caller's own key.
+    """
+    if ctx is None:
+        return None
+    try:
+        request = ctx.request_context.request
+    except Exception:
+        return None
+    if request is None:
+        return None
+    key = request.headers.get("x-api-key")
+    if not key or not key.startswith("aidress-sk-"):
+        return None
+    return key
+
+
+def _headers(include_api_key: bool = False, include_agent_key: bool = False, agent_key_override: Optional[str] = None, api_key_override: Optional[str] = None) -> dict:
     """Build request headers, optionally attaching the org API key and/or bearer agent key.
 
-    Bearer priority: AGENT_KEY env var > _session_agent_key (set via set_agent_key tool).
+    Org key priority:    api_key_override (this request's own X-API-KEY header, see
+                          _incoming_org_key) > API_KEY env var.
+    Bearer key priority: agent_key_override (this request's own Authorization header, see
+                          _incoming_bearer_key) > AGENT_KEY env var > _session_agent_key
+                          (set via set_agent_key).
     """
     h = {"Content-Type": "application/json"}
-    if include_api_key and API_KEY:
-        h["X-API-KEY"] = API_KEY
+    if include_api_key:
+        key = api_key_override or API_KEY
+        if key:
+            h["X-API-KEY"] = key
     if include_agent_key:
-        key = AGENT_KEY or _session_agent_key
+        key = agent_key_override or AGENT_KEY or _session_agent_key
         if key:
             h["Authorization"] = f"Bearer {key}"
     return h
 
 
-async def _post(path: str, body: dict, include_api_key: bool = False, include_agent_key: bool = False, extra_headers: dict | None = None) -> dict | list:
+async def _post(path: str, body: dict, include_api_key: bool = False, include_agent_key: bool = False, extra_headers: dict | None = None, agent_key_override: Optional[str] = None, api_key_override: Optional[str] = None) -> dict | list:
     """POST to the Aidress API — in-process if mounted, over network if standalone.
 
     When include_agent_key=True: bearer key takes priority; falls back to HTTP sig if
     AIDRESS_KEYPAIR_PATH is configured and no bearer key is set.
     """
     try:
-        h = _headers(include_api_key, include_agent_key)
+        h = _headers(include_api_key, include_agent_key, agent_key_override, api_key_override)
         if extra_headers:
             h.update(extra_headers)
         # Pre-serialize when signing so the digest covers exactly the bytes the server receives.
         # httpx re-serializes json= independently, so we must pass content= instead.
-        effective_agent_key = AGENT_KEY or _session_agent_key
+        effective_agent_key = agent_key_override or AGENT_KEY or _session_agent_key
         signing = include_agent_key and not effective_agent_key and _mcp_private_key and _mcp_keypair_agent_id
         body_bytes = json.dumps(body).encode() if signing else None
         if signing:
@@ -278,32 +408,42 @@ async def _post(path: str, body: dict, include_api_key: bool = False, include_ag
             else:
                 resp = await _asgi_client.post(path, json=body, headers=h, timeout=30.0)
         else:
-            async with httpx.AsyncClient() as client:
-                if signing:
-                    resp = await client.post(f"{BASE_URL}{path}", content=body_bytes, headers=h, timeout=30.0)
-                else:
-                    resp = await client.post(f"{BASE_URL}{path}", json=body, headers=h, timeout=30.0)
+            client = _get_standalone_client()
+            if signing:
+                resp = await client.post(f"{BASE_URL}{path}", content=body_bytes, headers=h, timeout=30.0)
+            else:
+                resp = await client.post(f"{BASE_URL}{path}", json=body, headers=h, timeout=30.0)
         return resp.json()
     except httpx.RequestError as exc:
         return {"error": f"Aidress API unreachable: {exc}"}
 
 
-async def _get(path: str, include_api_key: bool = False) -> dict | list:
+async def _get(path: str, include_api_key: bool = False, api_key_override: Optional[str] = None) -> dict | list:
     """GET from the Aidress API — in-process if mounted, over network if standalone."""
     try:
         if _asgi_client:
             resp = await _asgi_client.get(
-                path, headers=_headers(include_api_key), timeout=30.0,
+                path, headers=_headers(include_api_key, api_key_override=api_key_override), timeout=30.0,
             )
         else:
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(
-                    f"{BASE_URL}{path}",
-                    headers=_headers(include_api_key), timeout=30.0,
-                )
+            client = _get_standalone_client()
+            resp = await client.get(
+                f"{BASE_URL}{path}",
+                headers=_headers(include_api_key, api_key_override=api_key_override), timeout=30.0,
+            )
         return resp.json()
     except httpx.RequestError as exc:
         return {"error": f"Aidress API unreachable: {exc}"}
+
+
+# ── Enum aliases ─────────────────────────────────────────────────────────────
+# Literal types (not just Optional[str]) so the JSON schema sent to the model
+# enumerates legal values and rejects a near-miss client-side, before any network call.
+Protocol        = Literal["REST", "GraphQL", "gRPC"]
+SettlementRail  = Literal["x402", "stripe", "manual"]
+TermsFormat     = Literal["JSON", "XML"]
+MessageProtocol = Literal["a2a", "mcp", "raw"]
+HttpMethod      = Literal["GET", "POST"]
 
 
 # ── Tools: Discovery & Verification ─────────────────────────────────────────
@@ -311,7 +451,14 @@ async def _get(path: str, include_api_key: bool = False) -> dict | list:
 @mcp.tool()
 async def verify_agent(agent_id: str) -> dict:
     """
-    Look up an agent's trust profile before transacting with it.
+    Look up an agent's trust profile by agent_id.
+
+    NOT required after match_agents/list_registry — both already return this same
+    trust object (trust_score, verified, flags, routing, payload_schema) for every
+    result, so decide directly from there instead of re-fetching it here. Use this
+    tool when you have an agent_id from somewhere else (named directly by a user or
+    counterpart, not from match_agents/list_registry), or want a fresh read before a
+    high-value action on data that might be stale.
 
     Returns trust_score (0–100), verified status, capabilities, flags,
     routing info, and payload_schema (the semantic conventions the agent
@@ -326,38 +473,53 @@ async def verify_agent(agent_id: str) -> dict:
 
     Always check payload_schema before calling an agent so your payload
     uses the correct currency, units, and date format.
-
-    Use this before every transaction with an unknown counterpart.
     """
     return await _post("/verify", {"agent_id": agent_id})
 
 
 @mcp.tool()
 async def match_agents(
-    capabilities: list[str],
-    settlement_rail: Optional[str] = None,
+    capabilities: Optional[list[str]] = None,
+    settlement_rail: Optional[SettlementRail] = None,
+    org_name: Optional[str] = None,
+    message_protocol: Optional[MessageProtocol] = None,
 ) -> list:
     """
-    Find agents that can handle the requested capabilities, ranked by a composite
-    score (capability match + trust + success rate).
+    Find agents matching any combination of capability, settlement rail, org, or message
+    protocol, ranked by a composite score (capability match + trust + success rate).
 
     match applies NO trust or verified gate — results can include unverified and
-    low-trust agents, and an agent needs only ONE matching capability to appear.
-    ALWAYS call verify_agent on a result before transacting.
+    low-trust agents, and an agent needs only ONE matching capability to appear. Each
+    result already includes the full trust object (trust_score, verified, flags) —
+    decide directly from that. No need to call verify_agent on a result too; it returns
+    the same data. Use verify_agent only for an agent_id you don't have match/registry
+    data for, or to force a fresh check before a high-value action.
 
-    capabilities    — list of capability names, e.g. ["freight_booking", "customs_clearance"]
-    settlement_rail — optional filter: "x402", "stripe", "manual", or omit for any
+    All four filters are optional, but at least one must be given. Agents must match
+    every filter present in the call.
+    capabilities     — list of capability names, e.g. ["freight_booking", "customs_clearance"]
+    settlement_rail  — "x402", "stripe", "manual", or omit for any
+    org_name         — exact match, case-insensitive
+    message_protocol — "a2a", "mcp", or "raw" — restrict to agents whose endpoint speaks this format
 
     Returns a ranked list of trust objects. Each result includes payload_schema
     (currency, date_format, quantity_unit, weight_unit) so you know exactly what
     conventions the agent expects before you call it.
 
-    First result is the best match. Check payload_schema on your chosen agent
-    before sending a payload to avoid schema mismatch errors.
+    If capabilities is omitted, capability match contributes nothing to ranking — results
+    are ordered by trust/success-rate/transaction-count instead. First result is the best
+    match. Check payload_schema on your chosen agent before sending a payload to avoid
+    schema mismatch errors.
     """
-    body: dict = {"required_capabilities": capabilities}
+    body: dict = {}
+    if capabilities:
+        body["required_capabilities"] = capabilities
     if settlement_rail:
         body["settlement_rail"] = settlement_rail
+    if org_name:
+        body["org_name"] = org_name
+    if message_protocol:
+        body["message_protocol"] = message_protocol
     return await _post("/match", body)
 
 
@@ -374,12 +536,181 @@ async def get_agent(agent_id: str) -> dict:
 
 
 @mcp.tool()
+async def protocol_reference(
+    topic: Literal[
+        "mcp_handshake",
+        "register_capability_confirmation",
+        "register_advanced_fields",
+        "call_agent_advanced_fields",
+        "update_agent_advanced_fields",
+    ]
+) -> dict:
+    """
+    Look up the worked example for an edge-case protocol flow, on demand.
+
+    Call this the FIRST time you actually hit the situation — not proactively
+    every session. Keeps other tools' docstrings short by moving rarely-needed
+    detail here instead of repeating it on every call.
+
+    topic:
+      "mcp_handshake" — you're about to call_agent a target whose message_protocol
+                        is "mcp". Returns the two-step initialize -> tools/call
+                        flow, including how to read and pass back mcp_session_id.
+      "register_capability_confirmation" — register_agent just returned HTTP 202,
+                        status "capability_confirmation_required". Returns the
+                        two-step confirm/reject flow to complete registration.
+      "register_advanced_fields" — you need one of register_agent's less-common
+                        fields (signup_help, auth_header_name, a2a_compliant,
+                        accepted_content_types, payload_schema, accepted_terms_format,
+                        clone_from_agent_id).
+      "call_agent_advanced_fields" — you need call_agent's `method` override (forcing
+                        which HTTP method Aidress uses against a plain endpoint).
+      "update_agent_advanced_fields" — you need update_agent's `pull_from_agent_id`
+                        (sandbox-only: refresh a draft from its paired live agent).
+    """
+    reference = {
+        "register_capability_confirmation": {
+            "when": (
+                "register_agent's response was HTTP 202 with status "
+                "\"capability_confirmation_required\" — Aidress found an existing "
+                "canonical capability close to one you submitted and paused "
+                "registration to confirm the rename before proceeding."
+            ),
+            "step_1_initial_response": {
+                "status": "capability_confirmation_required",
+                "candidate_matches": {
+                    "shoe_sales": "shoe_selling",
+                    "fast_deliver": "express_delivery",
+                    "_comment": "your raw name -> suggested canonical name",
+                },
+            },
+            "step_2_recall": {
+                "call": "register_agent(... same fields as before ..., capability_confirmations=<map below>, candidate_matches=<echoed from step 1>)",
+                "capability_confirmations": {
+                    "shoe_sales": True,
+                    "fast_deliver": False,
+                    "_comment": "True = accept suggested canonical name, False = keep your raw name as a new capability",
+                },
+                "candidate_matches": (
+                    "Echo the candidate_matches dict from the 202 response verbatim "
+                    "so the server can reuse the LLM suggestion without re-querying "
+                    "(the LLM call is non-deterministic)."
+                ),
+            },
+        },
+        "register_advanced_fields": {
+            "signup_help": (
+                "Set ONLY if calling your endpoint requires the CALLER to supply its own "
+                "third-party credential (e.g. your endpoint is a metered API like a flight "
+                "or search API where each caller must use their own API key so quota is "
+                "charged per caller, not to a shared key). Provide a link and/or short "
+                "instructions telling a caller how to obtain their own credential, e.g. "
+                "\"Sign up at https://ignav.com to get a free API key.\" Leave unset if your "
+                "endpoint needs no per-caller credential."
+            ),
+            "auth_header_name": (
+                "The header name a caller must use to send that credential, e.g. "
+                "\"X-Api-Key\" or \"Authorization\" (for a bearer token, the caller sends "
+                "the full value \"Bearer <token>\"). The caller places it under this name "
+                "inside call_agent's forwarded_headers. Set alongside signup_help."
+            ),
+            "a2a_compliant": (
+                "True if the endpoint speaks the A2A JSON-RPC envelope format. Only "
+                "consulted when message_protocol is \"a2a\"."
+            ),
+            "accepted_content_types": (
+                "MIME types the endpoint accepts, e.g. [\"application/json\"]. Defaults to "
+                "[\"text/plain\", \"application/json\"] if omitted."
+            ),
+            "accepted_terms_format": "\"JSON\" or \"XML\" — the format your terms/pricing are published in, if any.",
+            "payload_schema": (
+                "Semantic conventions for this agent's payloads. Dict with any of: "
+                "currency (e.g. \"USD\"), date_format (e.g. \"ISO8601\"), quantity_unit "
+                "(e.g. \"individual_items\"), weight_unit (e.g. \"kg\"). Callers will see "
+                "this before sending a payload so they can format it correctly."
+            ),
+            "clone_from_agent_id": (
+                "SANDBOX ONLY (requires the org's sandbox_api_key). Pre-fills this new "
+                "agent's config fields (capabilities, specialty, endpoint_url, protocol, "
+                "settlement_rail, signup_help, auth_header_name, payload_schema, "
+                "http_methods, org_domain, contact_info) from an existing LIVE "
+                "(non-sandbox) agent your org owns, and permanently pairs the two — that "
+                "pairing is required by preview_sandbox_match and promote_sandbox_agent, "
+                "and cannot be established any other way. Never copies earned stats "
+                "(trust_score, transaction_count, success_rate, verified, flags). Any "
+                "other field also present in this call overrides the cloned value. 403 if "
+                "clone_from_agent_id isn't a live agent your org's production api_key "
+                "owns, or if this call isn't using a sandbox_api_key."
+            ),
+        },
+        "call_agent_advanced_fields": {
+            "method": (
+                "Overrides which HTTP method AIDRESS itself uses for the outbound request "
+                "to the target. NOT a header, and never relayed to the target (unrelated to "
+                "forwarded_headers). Leave unset to keep the current auto-detection (the "
+                "agent's registered http_methods[0]). Only affects plain endpoints — "
+                "A2A-compliant and message_protocol=\"mcp\"/\"raw\" targets always receive "
+                "POST regardless of this field."
+            ),
+        },
+        "update_agent_advanced_fields": {
+            "pull_from_agent_id": (
+                "SANDBOX ONLY (requires the org's sandbox_api_key). Overwrites agent_id's "
+                "config fields with its confirmed-paired live agent's CURRENT values — use "
+                "this to refresh a sandbox draft after the live original has changed since "
+                "you cloned it (see register_agent's clone_from_agent_id, which is the only "
+                "way that pairing gets established). Only succeeds if pull_from_agent_id is "
+                "already agent_id's confirmed pair (403 otherwise, even for an agent_id your "
+                "org owns but isn't paired with). Any other field also present in this call "
+                "overrides the pulled value. Earned stats are never touched either direction."
+            ),
+        },
+        "mcp_handshake": {
+            "when": (
+                "Only for call_agent targets whose message_protocol is \"mcp\". Some "
+                "MCP servers are stateful and require an initialize handshake before "
+                "any tool call; stateless ones do not — try step 1 first either way."
+            ),
+            "step_1_initialize": {
+                "call": "call_agent(agent_id, message_protocol=\"mcp\", payload=<payload below>)",
+                "payload": {
+                    "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": {"name": "my-agent", "version": "1"},
+                    },
+                },
+                "then": (
+                    "Read mcp_session_id from the RESULT. If it's absent, the server "
+                    "is stateless — go to step 2 without it."
+                ),
+            },
+            "step_2_tool_call": {
+                "call": (
+                    "call_agent(agent_id, message_protocol=\"mcp\", "
+                    "mcp_session_id=\"<from step 1, if any>\", payload=<payload below>)"
+                ),
+                "payload": {
+                    "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                    "params": {"name": "<tool>", "arguments": {}},
+                },
+            },
+            "note": "Step 1 is a handshake — it mints no transaction and needs no review.",
+        },
+    }
+    return reference[topic]
+
+
+@mcp.tool()
 async def list_registry(limit: int = 50, offset: int = 0) -> list:
     """
     Browse all agents in the Aidress registry, paginated. Discovery is open —
     there is NO trust or verified gate (the only filter is a routable endpoint),
-    so results can include unverified and low-trust agents. Always call
-    verify_agent before transacting.
+    so results can include unverified and low-trust agents. Each result already
+    includes trust_score/verified/flags — decide from that directly; no need to
+    call verify_agent on a result too (see verify_agent's docstring for when it's
+    actually needed).
 
     limit   — number of agents to return (max 200, default 50)
     offset  — skip this many agents for pagination (default 0)
@@ -417,134 +748,89 @@ async def import_agent(domain_url: str) -> dict:
 @mcp.tool()
 async def register_agent(
     agent_id:                str,
-    org_name:                Optional[str]        = None,
-    org_domain:              Optional[str]        = None,
-    contact_info:            Optional[str]        = None,
-    capabilities:            Optional[list[dict]] = None,
-    endpoint_url:            Optional[str]        = None,
-    protocol:                Optional[str]        = None,
-    settlement_rail:         Optional[str]        = None,
-    specialty:               Optional[str]        = None,
-    accepted_terms_format:   Optional[str]        = None,
-    message_protocol:        Optional[str]        = None,
-    signup_help:             Optional[str]        = None,
-    auth_header_name:        Optional[str]        = None,
-    a2a_compliant:           Optional[bool]       = None,
-    accepted_content_types:  Optional[list[str]]  = None,
-    payload_schema:          Optional[dict]       = None,
-    capability_confirmations: Optional[dict]      = None,
-    candidate_matches:       Optional[dict]       = None,
-    http_methods:            Optional[list[str]]  = None,
+    org_name:                Optional[str]              = None,
+    org_domain:              Optional[str]              = None,
+    contact_info:            Optional[str]              = None,
+    contact_email:           Optional[str]              = None,
+    capabilities:            Optional[list[dict]]       = None,
+    endpoint_url:            Optional[str]              = None,
+    protocol:                Optional[Protocol]         = None,
+    settlement_rail:         Optional[SettlementRail]   = None,
+    specialty:               Optional[str]              = None,
+    accepted_terms_format:   Optional[TermsFormat]      = None,
+    message_protocol:        Optional[MessageProtocol]  = None,
+    signup_help:             Optional[str]              = None,
+    auth_header_name:        Optional[str]              = None,
+    a2a_compliant:           Optional[bool]             = None,
+    accepted_content_types:  Optional[list[str]]        = None,
+    payload_schema:          Optional[dict]             = None,
+    capability_confirmations: Optional[dict]            = None,
+    candidate_matches:       Optional[dict]             = None,
+    http_methods:            Optional[list[HttpMethod]] = None,
+    clone_from_agent_id:     Optional[str]              = None,
+    price_schedule:          Optional[list[dict]]       = None,
+    payment_network:         Optional[str]              = None,
+    payment_pay_to:          Optional[str]              = None,
+    payment_asset:           Optional[str]              = None,
+    ctx:                     Optional[Context]          = None,
 ) -> dict:
     """
     Register a new AI agent (or human) with the Aidress trust registry.
 
     Required:
-      agent_id       — unique identifier for this agent (e.g. "my_agent_01")
+      agent_id      — unique identifier for this agent (e.g. "my_agent_01")
 
-    Conditionally required:
-      org_name       — your organisation name (e.g. "Acme Corp"). Required when
-                       endpoint_url is provided (i.e. you are registering an agent,
-                       not a human). Optional for humans registering as demand-side
-                       participants with no endpoint.
-      org_domain     — your domain (e.g. "acme.com") — one agent per domain.
-                       Required when endpoint_url is provided; optional otherwise.
+    Conditionally required (when endpoint_url is set, i.e. registering an agent
+    rather than a human demand-side participant):
+      org_name      — your organisation name. One agent per org_domain.
+      org_domain    — your domain (e.g. "acme.com").
+      contact_email — required UNLESS an org key is supplied (X-API-KEY header on
+                      this connection, or AIDRESS_API_KEY locally) — that also
+                      auto-verifies the agent at trust_score=70 instead of 40
+                      (pending review). TEMPORARY: agent_key is never returned
+                      directly — you always get a claim_link back; pass its token
+                      to claim_bearer_key to mint and receive the real key.
 
-    Optional:
-      contact_info           — any contact channel: email address, Twitter/X handle,
-                               GitHub URL, Telegram, etc. (e.g. "ops@acme.com" or
-                               "@acme_agent" or "https://github.com/acme"). Not
-                               restricted to email — use whatever channel is most
-                               relevant.
-      capabilities           — list of capabilities. Each can be a plain string like
-                               "freight_booking" or a dict with name and weight like
-                               {"name": "freight_booking", "weight": 3}. Weight defaults
-                               to 1. Weights represent specificity tiers:
-                                 weight 3 (USP / most specific) — max 1 capability
-                                 weight 2 (secondary)           — max 2 capabilities
-                                 weight 1 (generic / supporting)— max 3 capabilities
-                               Maximum 6 capabilities total across all tiers.
-      endpoint_url           — HTTPS URL where this agent accepts /call requests.
-                               Omit entirely if registering a human (demand-side only).
-      protocol               — "REST", "GraphQL", or "gRPC"
-      settlement_rail        — "x402", "stripe", or "manual". Set to "x402" if you want
-                               callers to be able to pay you at /call time.
-      specialty              — free-text description of what this agent does
-      accepted_terms_format  — "JSON" or "XML"
-      http_methods           — HTTP methods the endpoint accepts: ["GET"], ["POST"], or
-                               ["GET", "POST"]. Defaults to ["POST"] if omitted. Use
-                               ["GET"] for read-only lookup agents (price checks, status
-                               queries). Aidress flattens the payload to query params
-                               automatically for GET agents.
-      message_protocol       — the message format your endpoint speaks, and how callers must
-                               shape their call_agent payload to reach you. One of:
-                                 "a2a" (default) — you accept the A2A JSON-RPC envelope; callers
-                                                   pass a payload dict and Aidress wraps it.
-                                 "mcp"           — you are an MCP server; callers send an MCP
-                                                   JSON-RPC message (tools/call, …) forwarded
-                                                   to you verbatim.
-                                 "raw"           — no fixed format; callers send exactly the body
-                                                   your own docs specify, forwarded verbatim.
-      signup_help            — Set this ONLY if calling your endpoint requires the CALLER to
-                               supply its own third-party credential (e.g. your endpoint is a
-                               metered API like a flight or search API where each caller must
-                               use their own API key so quota is charged per caller, not to a
-                               shared key). Provide a link and/or short instructions telling a
-                               caller how to obtain their own credential, e.g.
-                               "Sign up at https://ignav.com to get a free API key."
-                               Leave unset if your endpoint needs no per-caller credential.
-      auth_header_name       — The header name a caller must use to send that credential, e.g.
-                               "X-Api-Key" or "Authorization" (for a bearer token, the caller
-                               sends the full value "Bearer <token>"). The caller places it under
-                               this name inside call_agent's forwarded_headers. Set alongside
-                               signup_help.
-      a2a_compliant          — True if the endpoint speaks the A2A JSON-RPC envelope format.
-                               Only consulted when message_protocol is "a2a".
-      accepted_content_types — MIME types the endpoint accepts, e.g. ["application/json"].
-                               Defaults to ["text/plain", "application/json"] if omitted.
-      payload_schema         — semantic conventions for this agent's payloads. Dict with any
-                               of: currency (e.g. "USD"), date_format (e.g. "ISO8601"),
-                               quantity_unit (e.g. "individual_items"), weight_unit (e.g. "kg").
-                               Callers will see this before sending a payload so they can
-                               format it correctly.
+    Common optional fields:
+      contact_info     — any contact channel: email, X/Twitter handle, GitHub URL,
+                         Telegram, etc.
+      capabilities     — list of strings or {"name", "weight"} dicts. weight 3
+                         (USP, max 1), weight 2 (secondary, max 2), weight 1
+                         (generic, max 3). Max 6 capabilities total.
+      endpoint_url     — HTTPS URL accepting /call requests. Omit for a human.
+      protocol         — "REST", "GraphQL", or "gRPC".
+      settlement_rail  — "x402" (lets callers pay you at /call time), "stripe",
+                         or "manual".
+      specialty        — free-text description of what this agent does.
+      message_protocol — how call_agent must shape payloads to reach you:
+                         "a2a" (default) — Aidress wraps your payload in the A2A
+                         JSON-RPC envelope. "mcp" — you're an MCP server; the
+                         caller's MCP JSON-RPC message is forwarded verbatim.
+                         "raw" — no fixed format; forwarded exactly as sent.
+      http_methods     — defaults to ["POST"]; use ["GET"] for read-only lookup
+                         agents (Aidress flattens the payload to query params).
+      price_schedule   — self-declared per-task pricing, e.g.
+                         [{"task": "search", "price": 0.01}, {"task": "deep_research",
+                         "price": 0.4}]. Surfaced to callers via verify_agent/
+                         match_agents (routing.price_schedule + routing.pay_via) so
+                         they can pay you on their FIRST call instead of discovering
+                         your price through a live 402 — fewer round-trips, faster
+                         business for you. Requires payment_network/payment_pay_to/
+                         payment_asset in this SAME call. Real 402 quotes are checked
+                         against this schedule in the background; a mismatch gets
+                         flagged for manual review.
+      payment_network  — CAIP-2 network your price_schedule pays out on, e.g. "eip155:8453".
+      payment_pay_to   — your receiving wallet address.
+      payment_asset    — asset contract address you accept (e.g. USDC's contract).
 
-    ── Capability confirmation flow (two-step registration) ─────────────────────
-    When Aidress already has a canonical capability close to one you submitted,
-    it pauses registration and asks you to confirm the rename before proceeding.
+    Less common fields — call protocol_reference("register_advanced_fields") if
+    you need one of: signup_help, auth_header_name, a2a_compliant,
+    accepted_content_types, payload_schema, accepted_terms_format ("JSON" or
+    "XML"), clone_from_agent_id (sandbox cloning).
 
-    Step 1 — initial call (no confirmation fields):
-      Response HTTP 202, status "capability_confirmation_required"
-      {
-        "status": "capability_confirmation_required",
-        "candidate_matches": {
-          "shoe_sales":   "shoe_selling",   ← your raw name → suggested canonical
-          "fast_deliver": "express_delivery"
-        }
-      }
-
-    Step 2 — re-call with the same fields plus:
-      capability_confirmations — map each raw capability name to True (accept the
-                                 suggested canonical) or False (keep your raw name
-                                 as a new capability):
-                                 {"shoe_sales": True, "fast_deliver": False}
-                                   True  → registered as "shoe_selling"
-                                   False → registered as "fast_deliver" (new entry)
-      candidate_matches        — echo the candidate_matches dict from the 202
-                                 response verbatim so the server can reuse the LLM
-                                 suggestion without re-querying (non-deterministic).
-
-    Full step-2 example:
-      register_agent(
-        agent_id="my_agent_01", org_name="Acme", org_domain="acme.com",
-        contact_info="ops@acme.com",
-        capabilities=["shoe_sales", "fast_deliver"],
-        capability_confirmations={"shoe_sales": True, "fast_deliver": False},
-        candidate_matches={"shoe_sales": "shoe_selling"},
-      )
-    ─────────────────────────────────────────────────────────────────────────────
-
-    If AIDRESS_API_KEY is set and valid, the agent is auto-verified at
-    trust_score=70. Otherwise it starts at 40 (pending review).
+    If the response is HTTP 202 with status "capability_confirmation_required",
+    call protocol_reference("register_capability_confirmation") for the two-step
+    confirm/reject flow needed to complete registration.
     """
     body: dict = {"agent_id": agent_id}
     if org_name is not None:
@@ -553,6 +839,8 @@ async def register_agent(
         body["org_domain"] = org_domain
     if contact_info is not None:
         body["contact_info"] = contact_info
+    if contact_email is not None:
+        body["contact_email"] = contact_email
     if capabilities:
         body["capabilities"] = capabilities
     if endpoint_url:
@@ -583,49 +871,119 @@ async def register_agent(
         body["candidate_matches"] = candidate_matches
     if http_methods is not None:
         body["http_methods"] = http_methods
+    if clone_from_agent_id is not None:
+        body["clone_from_agent_id"] = clone_from_agent_id
+    if price_schedule is not None:
+        body["price_schedule"] = price_schedule
+    if payment_network is not None:
+        body["payment_network"] = payment_network
+    if payment_pay_to is not None:
+        body["payment_pay_to"] = payment_pay_to
+    if payment_asset is not None:
+        body["payment_asset"] = payment_asset
 
-    return await _post("/register", body, include_api_key=True)
+    return await _post(
+        "/register", body, include_api_key=True,
+        api_key_override=_incoming_org_key(ctx),
+    )
+
+
+@mcp.tool()
+async def rotate_agent_key(agent_id: str, ctx: Optional[Context] = None) -> dict:
+    """
+    Request rotation of an agent's bearer key — the previous key stops working the moment
+    the new one is actually claimed (see claim_bearer_key).
+
+    Auth: an org key that owns this agent skips a check that this agent has a
+    contact_email on file (that check is otherwise required, 400 if missing). On the
+    hosted remote connector, send your org's X-API-KEY header on the MCP connection
+    itself; locally, set AIDRESS_API_KEY in the server environment.
+
+    TEMPORARY (short-term server-side change): agent_key is currently NEVER returned
+    directly here, even with an org key — the response instead has a claim_link (and
+    agent_key: None) regardless of credentials. Pass the token from that link to
+    claim_bearer_key to actually mint and receive the key.
+
+    agent_id — the agent whose bearer key to rotate.
+
+    Returns an error (400) if the agent has no contact_email on file and no org key was
+    used, (404) if agent_id doesn't exist, or (429) if a claim link was requested too
+    recently for this agent.
+    """
+    return await _post(
+        "/rotate", {"agent_id": agent_id}, include_api_key=True,
+        api_key_override=_incoming_org_key(ctx),
+    )
+
+
+@mcp.tool()
+async def claim_bearer_key(token: str) -> dict:
+    """
+    Redeem a claim-token link's token (from register_agent's or rotate_agent_key's
+    claim_link field) and receive the actual bearer key. This is the GET /rotate?token=...
+    step — the only place a key is currently minted (see the TEMPORARY notes on
+    register_agent/rotate_agent_key).
+
+    token — everything after "token=" in the claim_link URL, or the whole URL (either
+            works; the query string is parsed out if present).
+
+    Returns an error (400) if the token is invalid or already used. Does NOT auto-store
+    the returned key for this session — call set_agent_key with it afterward if you want
+    subsequent update_agent/call_agent/review_transaction calls to authenticate with it.
+    """
+    if "token=" in token:
+        token = token.rsplit("token=", 1)[-1]
+    return await _get(f"/rotate?token={urllib.parse.quote(token, safe='')}")
 
 
 @mcp.tool()
 async def update_agent(
     agent_id:               str,
-    org_name:               Optional[str]       = None,
-    org_domain:             Optional[str]       = None,
-    contact_info:           Optional[str]       = None,
-    capabilities:           Optional[list[dict]] = None,
-    specialty:              Optional[str]       = None,
-    endpoint_url:           Optional[str]       = None,
-    protocol:               Optional[str]       = None,
-    accepted_terms_format:  Optional[str]       = None,
-    settlement_rail:        Optional[str]       = None,
-    payload_schema:         Optional[dict]      = None,
-    message_protocol:       Optional[str]       = None,
-    signup_help:            Optional[str]       = None,
-    auth_header_name:       Optional[str]       = None,
-    a2a_compliant:          Optional[bool]      = None,
-    accepted_content_types: Optional[list[str]] = None,
-    http_methods:           Optional[list[str]] = None,
+    org_name:               Optional[str]              = None,
+    org_domain:             Optional[str]              = None,
+    contact_info:           Optional[str]              = None,
+    contact_email:          Optional[str]              = None,
+    capabilities:           Optional[list[dict]]       = None,
+    specialty:              Optional[str]              = None,
+    endpoint_url:           Optional[str]              = None,
+    protocol:               Optional[Protocol]         = None,
+    accepted_terms_format:  Optional[TermsFormat]      = None,
+    settlement_rail:        Optional[SettlementRail]   = None,
+    payload_schema:         Optional[dict]             = None,
+    message_protocol:       Optional[MessageProtocol]  = None,
+    signup_help:            Optional[str]              = None,
+    auth_header_name:       Optional[str]              = None,
+    a2a_compliant:          Optional[bool]             = None,
+    accepted_content_types: Optional[list[str]]        = None,
+    http_methods:           Optional[list[HttpMethod]] = None,
+    pull_from_agent_id:     Optional[str]              = None,
+    price_schedule:         Optional[list[dict]]       = None,
+    payment_network:        Optional[str]              = None,
+    payment_pay_to:         Optional[str]              = None,
+    payment_asset:          Optional[str]              = None,
+    ctx:                    Optional[Context]          = None,
 ) -> dict:
     """
     Update an existing agent's profile fields. Only provided fields are changed;
     omitted fields remain unchanged.
 
     Auth: any one of —
-      - Bearer agent key: set AIDRESS_AGENT_KEY env var before starting the server,
-        or call set_agent_key("<key>") once in-session after registering
+      - Bearer agent key: on the hosted remote connector, send your own
+        Authorization: Bearer <agent_key> header on the MCP connection (this is
+        what it authenticates with automatically). Locally: set AIDRESS_AGENT_KEY
+        env var before starting the server, or call set_agent_key("<key>") once
+        in-session after registering.
       - Ed25519 keypair:  set AIDRESS_KEYPAIR_PATH (HTTP Message Signature, RFC 9421)
-      - Org key:          set AIDRESS_API_KEY env var (must own this agent)
+      - Org key:          must own this agent. On the hosted remote connector, send
+        your org's X-API-KEY header on the MCP connection itself; locally, set
+        AIDRESS_API_KEY in the server environment.
     Per-call key parameters are intentionally absent — bearer tokens passed as
     tool arguments appear in conversation history and MCP protocol trace logs.
 
     agent_id       — the agent to update (cannot be changed)
 
-    Updatable fields:
-      org_name, org_domain, contact_info, specialty, endpoint_url,
-      protocol, accepted_terms_format, settlement_rail, capabilities,
-      payload_schema, message_protocol, signup_help, auth_header_name,
-      a2a_compliant, accepted_content_types, http_methods
+    contact_email — where rotate_agent_key's claim-token link is sent when this
+                   agent's key is rotated without an org/admin credential.
 
     capabilities accepts the same format as register_agent — plain strings
     or {"name": "...", "weight": N} dicts.
@@ -638,11 +996,20 @@ async def update_agent(
                              "raw". Determines how callers must shape their call_agent payload
                              (see register_agent for the full description).
     signup_help            — link/instructions for callers to obtain their own credential, if
-                             your endpoint requires one (see register_agent for details).
+                             your endpoint requires one (see
+                             protocol_reference("register_advanced_fields") for details).
     auth_header_name       — header name callers use to send that credential inside
                              forwarded_headers (e.g. "X-Api-Key", "Authorization").
     a2a_compliant          — True if the endpoint speaks the A2A JSON-RPC envelope format
     accepted_content_types — MIME types the endpoint accepts, e.g. ["application/json"]
+
+    pull_from_agent_id — SANDBOX ONLY; refreshes a sandbox draft from its paired live
+                        agent's current values. See
+                        protocol_reference("update_agent_advanced_fields").
+
+    price_schedule, payment_network, payment_pay_to, payment_asset — see register_agent;
+    same fields, same rule (all three payment_* fields required together whenever
+    price_schedule is set in this call).
 
     Returns the updated trust object.
     """
@@ -653,6 +1020,8 @@ async def update_agent(
         body["org_domain"] = org_domain
     if contact_info is not None:
         body["contact_info"] = contact_info
+    if contact_email is not None:
+        body["contact_email"] = contact_email
     if capabilities is not None:
         body["capabilities"] = capabilities
     if specialty is not None:
@@ -679,8 +1048,100 @@ async def update_agent(
         body["accepted_content_types"] = accepted_content_types
     if http_methods is not None:
         body["http_methods"] = http_methods
+    if pull_from_agent_id is not None:
+        body["pull_from_agent_id"] = pull_from_agent_id
+    if price_schedule is not None:
+        body["price_schedule"] = price_schedule
+    if payment_network is not None:
+        body["payment_network"] = payment_network
+    if payment_pay_to is not None:
+        body["payment_pay_to"] = payment_pay_to
+    if payment_asset is not None:
+        body["payment_asset"] = payment_asset
 
-    return await _post("/update", body, include_api_key=True, include_agent_key=True)
+    return await _post(
+        "/update", body, include_api_key=True, include_agent_key=True,
+        agent_key_override=_incoming_bearer_key(ctx),
+        api_key_override=_incoming_org_key(ctx),
+    )
+
+
+@mcp.tool()
+async def preview_sandbox_match(
+    sandbox_agent_id: str,
+    required_capabilities: list[str],
+    settlement_rail: Optional[SettlementRail] = None,
+    ctx: Optional[Context] = None,
+) -> dict:
+    """
+    Preview exactly where a sandbox agent's tested config would rank against REAL, live
+    competition — before you actually promote it. Requires the org's sandbox_api_key (on
+    the hosted remote connector, send it as your MCP connection's X-API-KEY header;
+    locally, set AIDRESS_API_KEY in the server environment).
+
+    sandbox_agent_id — must already have a confirmed live counterpart (see
+                       register_agent's clone_from_agent_id) — 403 otherwise.
+    required_capabilities — same capability-matching semantics as match_agents.
+    settlement_rail — optional filter on the real competitor set: "x402", "stripe",
+                      "manual", or omit for any.
+
+    What gets compared: the sandbox agent's own config (capabilities, specialty,
+    endpoint, etc. — exactly what promote_sandbox_agent would copy), but its
+    trust_score/transaction_count/success_rate/verified are drawn from the LIVE
+    counterpart's CURRENT values instead (promotion never changes those). Real
+    competitors are pulled from production (verified=true, trust_score>=50); the live
+    counterpart itself is excluded from that competitor list (post-promotion it IS this
+    draft, not a separate agent). Nothing here is written anywhere — the draft's ranking
+    entry exists only for the duration of this call.
+
+    Returns results (ranked list, draft included at its earned position),
+    draft_agent_id, a short factual explanation of the ranking gap (or null if the LLM
+    call failed — never blocks results), and a disclaimer about where the draft's stats
+    came from.
+    """
+    body = {"sandbox_agent_id": sandbox_agent_id, "required_capabilities": required_capabilities}
+    if settlement_rail:
+        body["settlement_rail"] = settlement_rail
+    return await _post(
+        "/sandbox/preview_match", body, include_api_key=True,
+        api_key_override=_incoming_org_key(ctx),
+    )
+
+
+@mcp.tool()
+async def promote_sandbox_agent(
+    sandbox_agent_id: str,
+    real_agent_id: str,
+    ctx: Optional[Context] = None,
+) -> dict:
+    """
+    Push a sandbox agent's tested config onto its paired live agent — the way a
+    sandbox-tested change actually goes live. Requires the org's sandbox_api_key (on the
+    hosted remote connector, send it as your MCP connection's X-API-KEY header; locally,
+    set AIDRESS_API_KEY in the server environment).
+
+    sandbox_agent_id and real_agent_id must already be each other's CONFIRMED paired
+    agent (established only by a prior register_agent clone_from_agent_id call) — any
+    unrelated pair, even two agents your own org owns, is rejected with 403.
+
+    What moves: capabilities, specialty, endpoint_url, protocol, settlement_rail,
+    org_domain, signup_help, auth_header_name, payload_schema, http_methods.
+    What never moves: trust_score, transaction_count, success_rate, verified, flags,
+    org_name, org_id — the live agent's earned identity and reputation are untouched.
+    Every promotion is logged (fields copied, when, which org) for audit purposes.
+
+    Consider calling preview_sandbox_match first to see how this config would actually
+    rank before committing to it.
+
+    Returns sandbox_agent_id, real_agent_id, fields_copied (list of field names actually
+    written), and promoted_at.
+    """
+    return await _post(
+        "/sandbox/promote",
+        {"sandbox_agent_id": sandbox_agent_id, "real_agent_id": real_agent_id},
+        include_api_key=True,
+        api_key_override=_incoming_org_key(ctx),
+    )
 
 
 @mcp.tool()
@@ -705,6 +1166,14 @@ async def set_agent_key(agent_key: str) -> dict:
     AIDRESS_AGENT_KEY is already set in the environment, this call is a no-op
     for bearer auth (the env var wins), though it still returns success.
 
+    On the hosted remote connector (api.aidress.ai), this key is stored in a
+    process-wide slot shared by every remote caller currently connected — avoid
+    this tool there. Instead send your own Authorization: Bearer <agent_key>
+    header on the MCP connection itself; update_agent/call_agent/review_transaction
+    read that per-request and it always wins over anything set here. This tool
+    remains correct for a local single-user stdio server, where there is exactly
+    one caller.
+
     agent_key — the aidress-agent-sk-... key returned by register_agent
 
     To use an org key for update operations, set AIDRESS_API_KEY in the server
@@ -727,146 +1196,131 @@ async def set_agent_key(agent_key: str) -> dict:
 # ── Tools: Transactions & Reviews ───────────────────────────────────────────
 
 
+def _build_v1_network_caip2_map() -> dict[str, str]:
+    """Legacy network name → CAIP-2 (e.g. "base-sepolia" → "eip155:84532"). Pulled from
+    the x402 SDK's own tables so it can't drift; hardcoded subset is the fallback."""
+    mapping: dict[str, str] = {
+        "base": "eip155:8453", "base-sepolia": "eip155:84532",
+        "polygon": "eip155:137", "polygon-amoy": "eip155:80002",
+        "avalanche": "eip155:43114", "avalanche-fuji": "eip155:43113",
+    }
+    try:
+        from x402.mechanisms.evm.v1.constants import V1_NETWORK_CHAIN_IDS
+        mapping.update({name: f"eip155:{chain_id}" for name, chain_id in V1_NETWORK_CHAIN_IDS.items()})
+    except Exception:
+        pass
+    try:
+        from x402.mechanisms.svm.constants import V1_TO_V2_NETWORK_MAP
+        mapping.update(V1_TO_V2_NETWORK_MAP)
+    except Exception:
+        pass
+    return mapping
+
+
+_V1_NETWORK_TO_CAIP2 = _build_v1_network_caip2_map()
+
+
+def _normalize_payment_requirement_item(item: dict) -> dict:
+    """One `accepts[]` entry, v1 → v2: maxAmountRequired→amount, legacy network→CAIP-2,
+    drop the v1 per-item string `resource` (v2 has it once at the body's top level)."""
+    if not isinstance(item, dict):
+        return item
+    out = dict(item)
+    out.pop("resource", None)
+    if "amount" not in out and "maxAmountRequired" in out:
+        out["amount"] = out.pop("maxAmountRequired")
+    network = out.get("network")
+    if isinstance(network, str) and ":" not in network:
+        out["network"] = _V1_NETWORK_TO_CAIP2.get(network, network)
+    return out
+
+
+def _normalize_payment_required_body(body):
+    """Reshape a passthrough 402 body to v2 regardless of what the receiver actually sent.
+    Body only — never touches the payment-required header, since a wallet signs off that
+    header verbatim and rewriting it would break verification on the receiver's side."""
+    if not isinstance(body, dict) or not isinstance(body.get("accepts"), list):
+        return body
+    out = dict(body)
+    out["accepts"] = [_normalize_payment_requirement_item(a) for a in body["accepts"]]
+    if not isinstance(out.get("resource"), dict):
+        v1_item = next(
+            (a for a in body["accepts"] if isinstance(a, dict) and isinstance(a.get("resource"), str)),
+            None,
+        )
+        if v1_item is not None:
+            out["resource"] = {
+                "url": v1_item["resource"],
+                **({"description": v1_item["description"]} if v1_item.get("description") else {}),
+                **({"mimeType": v1_item["mimeType"]} if v1_item.get("mimeType") else {}),
+            }
+    out["x402Version"] = 2
+    return out
+
+
 @mcp.tool()
 async def call_agent(
     agent_id:          str,
     payload:           dict,
     caller_agent_id:   str,
     x_payment:         Optional[str] = None,
-    message_protocol:  Optional[str] = None,
+    message_protocol:  Optional[MessageProtocol] = None,
     mcp_session_id:    Optional[str] = None,
     forwarded_headers: Optional[dict] = None,
+    method:            Optional[HttpMethod] = None,
+    ctx:               Optional[Context] = None,
 ) -> dict:
     """
     Send a request to a registered agent through the Aidress proxy.
 
-    All calls are logged. Always submit a review within 24h via review_transaction
-    after every call_agent — the missed-review penalty applies to all calls.
-    Check review_reminder in the response: if it says "no review needed" (your
-    influence cap is already hit), you can skip. Otherwise, review every time.
+    All calls are logged. Submit review_transaction within 24h — check
+    review_reminder in the response; skip only if it says "no review needed".
 
-    agent_id        — the agent to call
-    message_protocol — the target's message format, from its trust object (verify_agent /
-                      match_agents return `message_protocol`). Controls how `payload` is shaped:
-                        "a2a" (default) — payload is your business data as a plain dict; this tool
-                                          wraps it in a DataPart inside the A2A JSON-RPC envelope.
-                        "mcp"           — payload IS a complete MCP JSON-RPC message and is sent
-                                          verbatim, e.g.
-                                          {"jsonrpc":"2.0","id":1,"method":"tools/call",
-                                           "params":{"name":"<tool>","arguments":{...}}}
-                        "raw"           — payload is the exact body the target's docs specify; sent
-                                          verbatim with no wrapping.
-                      Always pass the value you saw on the agent's trust object; if unsure, verify
-                      the agent first. Mis-declaring it returns 422 from /call.
-    mcp_session_id  — MCP session token, only for message_protocol="mcp". See the handshake
-                      note below; leave unset otherwise.
-    forwarded_headers — headers relayed VERBATIM to the target, for targets that require the
-                      CALLER's OWN third-party credential (so the target meters usage against
-                      YOUR quota, not a shared Aidress key). Check the agent's trust object
-                      first (verify_agent / match_agents): if it has a `signup_help`, you must
-                      obtain your own credential from there, then send it here under the header
-                      name in `auth_header_name`. Example:
-                        # trust object → signup_help="https://ignav.com...", auth_header_name="X-Api-Key"
-                        call_agent(agent_id, payload={...},
-                                   forwarded_headers={"X-Api-Key": "<your own key>"})
-                      For a bearer target (auth_header_name="Authorization") send the full value:
-                        forwarded_headers={"Authorization": "Bearer <your token>"}
-                      If a call returns 401/403 and the agent has signup_help, that's the signal
-                      to go get your own credential and retry with it here. Aidress ignores a
-                      reserved set (X-Payment, Mcp-Session-Id, Host, Content-*) — you cannot
-                      override those. Leave unset if the agent declares no signup_help.
-    payload         — For "a2a": your business data as a plain dict, e.g.
-                      {"task": "book_shipment", "from": "SIN"} — wrapped automatically in a DataPart.
-                      For "mcp"/"raw": the exact message described under message_protocol above.
+    agent_id        — the agent to call.
+    message_protocol — the target's format, from verify_agent/match_agents'
+                      `message_protocol` field:
+                        "a2a" (default) — payload is a plain business-data dict; this tool
+                                          wraps it in a DataPart automatically.
+                        "mcp"           — payload IS a complete MCP JSON-RPC message, sent
+                                          verbatim. Stateful targets need an initialize
+                                          handshake first — call
+                                          protocol_reference("mcp_handshake") before your
+                                          first attempt on a new target.
+                        "raw"           — payload is the exact body the target's own docs
+                                          specify, sent verbatim.
+                      Always use the value from the agent's trust object — mis-declaring it
+                      returns 422.
+    mcp_session_id  — session token from a prior initialize call. Only for
+                      message_protocol="mcp"; see protocol_reference("mcp_handshake").
+    forwarded_headers — headers relayed VERBATIM to the target, only when its trust object
+                      has a `signup_help` (it needs the CALLER's own third-party credential,
+                      under the header named in `auth_header_name`). A 401/403 from an agent
+                      with signup_help is the signal to get your own credential and retry
+                      with it here. Reserved headers (X-Payment, Mcp-Session-Id, Host,
+                      Content-*) are ignored.
+    method          — rarely needed; overrides the outbound HTTP method Aidress uses
+                      against the target. See protocol_reference("call_agent_advanced_fields").
+    payload         — business data (message_protocol="a2a") or the exact protocol message
+                      (message_protocol="mcp"/"raw"). Check payload_schema on the agent first
+                      — mismatched currency/units/date format returns 409.
+    caller_agent_id — REQUIRED: your agent's ID. Must match your set agent key or /call
+                      rejects the request (401 missing/invalid key, 403 mismatch). No
+                      anonymous calls.
+    x_payment       — Leave UNSET in normal use — only for a pre-signed x402 PaymentPayload
+                      (V2) if you're driving your own wallet manually. On a 402 without
+                      x_payment, the result carries a `payment.pay_via` proxy URL instead —
+                      see the server's payment-flow instructions (shown at session start)
+                      for how to use it.
+                      SKIP THE 402 ENTIRELY: if verify_agent/match_agents already returned
+                      this agent's `routing.price_schedule` + `routing.pay_via`, sign a
+                      PaymentPayload yourself for the matching task's declared price and
+                      pass it here as x_payment on your FIRST call — no discovery round-trip.
 
-                      ── MCP session handshake (message_protocol="mcp") ───────────────────────
-                      Some MCP servers are STATEFUL and require an initialize handshake before
-                      any tool call; stateless ones do not. Always do this two-step flow first:
-
-                        1) Call initialize:
-                             call_agent(agent_id, message_protocol="mcp", payload={
-                               "jsonrpc":"2.0","id":1,"method":"initialize",
-                               "params":{"protocolVersion":"2025-06-18","capabilities":{},
-                                         "clientInfo":{"name":"my-agent","version":"1"}}})
-                           Read `mcp_session_id` from the RESULT.
-                        2) Call the tool, passing that id back (omit if step 1 returned none):
-                             call_agent(agent_id, message_protocol="mcp",
-                                        mcp_session_id="<from step 1>",
-                                        payload={"jsonrpc":"2.0","id":2,"method":"tools/call",
-                                                 "params":{"name":"<tool>","arguments":{...}}})
-
-                      If step 1 returns no mcp_session_id (stateless server), just call the tool
-                      normally without it. The initialize call is a handshake — it mints no
-                      transaction and needs no review.
-                      ─────────────────────────────────────────────────────────────────────────
-
-                      ── Raw HTTP structure (if calling POST /call directly, message_protocol=a2a) ──
-                      The /call endpoint requires this nested envelope:
-
-                        {
-                          "agent_id": "<target>",
-                          "message": {
-                            "jsonrpc": "2.0",
-                            "method": "message/send",
-                            "params": {
-                              "message": {
-                                "role": "user",
-                                "parts": [ <one or more parts> ]
-                              }
-                            }
-                          }
-                        }
-
-                      Part shapes — discriminated on the "kind" field:
-                        TextPart: {"kind": "text", "content_type": "text/plain",       "content": "plain string"}
-                        DataPart: {"kind": "data", "content_type": "application/json", "content": {...}}
-                        FilePart: {"kind": "file", "content_type": "application/pdf",  "content": "<base64>"}
-
-                      For SSE streaming use "method": "message/stream" instead of "message/send".
-                      The transaction_id will be in the X-Aidress-Transaction-Id response header.
-                      ─────────────────────────────────────────────────────────────────────────
-
-                      Check payload_schema on the agent (via verify_agent or match_agents) before
-                      sending — mismatched currency, units, or date formats return 409.
-    caller_agent_id — REQUIRED: your agent's ID. Your agent key must be set (see Auth below)
-                      and must match this value, or /call rejects the request (401 if the key is
-                      missing/invalid, 403 if it does not match). Anonymous calls are not allowed.
-    x_payment       — Usually leave this UNSET. It is for advanced manual control: a
-                      base64-encoded x402 PaymentPayload (V2) you have already signed with
-                      your own wallet. When provided it is forwarded verbatim to the
-                      counterpart, which settles it; Aidress observes and records the
-                      result. Most callers instead use the `payment.pay_via` flow below.
-
-                      ── PAYMENT FLOW (Aidress facilitates, never holds funds) ───────────
-                      If the counterpart demands payment (HTTP 402) and you did NOT pass
-                      x_payment, the result includes a `payment` object:
-
-                        {
-                          "required": true,
-                          "pay_via":  "https://api.aidress.ai/pay/<agent_id>",
-                          "how":      "<instructions>",
-                          "payment_required": "<base64 requirements: payTo, amount, asset, network>"
-                        }
-
-                      To pay: point your OWN x402 wallet client at `pay_via` and send the
-                      same payload. `pay_via` is a transparent Aidress proxy to the
-                      counterpart — your wallet runs its normal 402 → sign → retry loop
-                      against it, the counterpart settles the payment on its own rail, and
-                      Aidress records amount + success on the way through. Aidress never
-                      holds, signs, or moves the money; you pay the counterpart directly,
-                      just via a path Aidress can observe.
-
-                      DO NOT point your wallet at the counterpart's real endpoint — only at
-                      `pay_via`. Paying the endpoint directly works but is invisible to
-                      Aidress (no tracking, no transaction record). Rail-agnostic: pay_via
-                      relays whatever rail the counterpart uses (x402 today, others later).
-
-    Auth (REQUIRED — every call must be authenticated):
-      Set AIDRESS_AGENT_KEY env var before starting the server, or call
-      set_agent_key("<key>") once in-session after registering, or configure
-      AIDRESS_KEYPAIR_PATH for Ed25519 HTTP Message Signatures (RFC 9421).
-      Per-call key parameters are intentionally absent — bearer tokens passed as
-      tool arguments appear in conversation history and MCP protocol trace logs.
+    Auth (REQUIRED): on the hosted remote connector, your own Authorization: Bearer
+    <agent_key> header on the MCP connection is used automatically. Locally: set
+    AIDRESS_AGENT_KEY env var, call set_agent_key(...) once in-session, or configure
+    AIDRESS_KEYPAIR_PATH. Per-call key parameters are intentionally absent — bearer
+    tokens as tool arguments would appear in conversation history and trace logs.
 
     Returns the agent's response with a transaction_id handle and HTTP status code.
     """
@@ -891,6 +1345,8 @@ async def call_agent(
     body: dict = {"agent_id": agent_id, "message": message, "caller_agent_id": caller_agent_id}
     if forwarded_headers:
         body["forwarded_headers"] = forwarded_headers
+    if method:
+        body["method"] = method
 
     # Forward X-Payment (x402 settlement) and Mcp-Session-Id (MCP session token from a prior
     # initialize handshake) as headers when present; both are relayed to the counterpart.
@@ -902,7 +1358,12 @@ async def call_agent(
     result = await _post(
         "/call", body, include_agent_key=True,
         extra_headers=(_headers or None),
+        agent_key_override=_incoming_bearer_key(ctx),
     )
+
+    # Normalize the passthrough 402 body to v2 shape, whether or not x_payment was set.
+    if isinstance(result, dict) and result.get("status_code") == 402:
+        result["body"] = _normalize_payment_required_body(result.get("body"))
 
     # Payment required and the caller didn't pre-sign one. Aidress never holds funds, so
     # rather than signing here we hand back the transparent /pay proxy URL for this agent.
@@ -918,11 +1379,13 @@ async def call_agent(
             # be reviewed. Attribution comes from the authenticated call, not a
             # spoofable query param, so it stays framing-safe.
             "pay_via":  f"{BASE_URL}/pay/{agent_id}?call_ref={result.get('transaction_id')}",
+            # Full nonce/single-call/never-point-at-real-endpoint rules are already in the
+            # server instructions (sent once at session start) — restate only the pointer
+            # plus the one thing that's new here (the review_transaction reminder), instead
+            # of repeating the whole explanation on every 402 in the conversation.
             "how": (
-                "Point your x402 wallet client at pay_via and send the same payload. "
-                "The payment routes through Aidress (so it is tracked) while Aidress "
-                "never touches the funds — you pay the counterpart directly via the proxy. "
-                "Do NOT pay the agent's real endpoint directly. After it settles, submit "
+                "See the x402 payment flow in your session instructions — call your wallet "
+                "tool once, pointed at pay_via, in a single call. After it settles, submit "
                 "review_transaction if you have the transaction_id."
             ),
             "payment_required": (result.get("response_headers") or {}).get("payment-required"),
@@ -938,6 +1401,7 @@ async def review_transaction(
     receiver_agent_id: str,
     success:           bool,
     score:             int,
+    ctx:               Optional[Context] = None,
 ) -> dict:
     """
     Submit a trust review after a confirmed exchange with another agent.
@@ -951,10 +1415,12 @@ async def review_transaction(
     success           — True if the transaction completed successfully
     score             — trust rating 1 (very poor) to 10 (excellent)
 
-    Auth (always required):
-      Set AIDRESS_AGENT_KEY env var before starting the server, or call
-      set_agent_key("<key>") once in-session after registering, or configure
-      AIDRESS_KEYPAIR_PATH for Ed25519 HTTP Message Signatures (RFC 9421).
+    Auth (always required): on the hosted remote connector, your own
+      Authorization: Bearer <agent_key> header on the MCP connection is used
+      automatically. Locally: set AIDRESS_AGENT_KEY env var before starting the
+      server, or call set_agent_key("<key>") once in-session after registering,
+      or configure AIDRESS_KEYPAIR_PATH for Ed25519 HTTP Message Signatures
+      (RFC 9421).
 
     Anti-gaming rules enforced:
       - Caller trust_score must be >= 50
@@ -971,23 +1437,28 @@ async def review_transaction(
         "success":           success,
         "score":             score,
     }
-    return await _post("/review", body, include_agent_key=True)
+    return await _post(
+        "/review", body, include_agent_key=True,
+        agent_key_override=_incoming_bearer_key(ctx),
+    )
 
 
 
 # ── Tools: Org Management ───────────────────────────────────────────────────
 
 @mcp.tool()
-async def list_org_agents() -> list:
+async def list_org_agents(ctx: Optional[Context] = None) -> list:
     """
-    List all agents registered under your org API key (AIDRESS_API_KEY).
+    List all agents registered under your org API key.
 
-    Requires AIDRESS_API_KEY to be set in the MCP server environment.
+    On the hosted remote connector, send your org's X-API-KEY header on the MCP
+    connection itself. Locally, set AIDRESS_API_KEY in the server environment.
     Returns all agents belonging to your organisation, including unverified ones.
     """
-    if not API_KEY:
-        return [{"error": "AIDRESS_API_KEY is not set. Set it in your MCP server environment to use this tool."}]
-    return await _get("/org/agents", include_api_key=True)
+    org_key = _incoming_org_key(ctx)
+    if not org_key and not API_KEY:
+        return [{"error": "No org API key found. Send your org's X-API-KEY header on your MCP connection (or set AIDRESS_API_KEY in a local server's environment)."}]
+    return await _get("/org/agents", include_api_key=True, api_key_override=org_key)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

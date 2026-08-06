@@ -42,6 +42,7 @@ import hashlib
 import os
 import urllib.request
 import urllib.error
+import urllib.parse
 import json
 import time
 
@@ -154,9 +155,21 @@ class AidressClient:
         base_url: str = "https://api.aidress.ai",
         agent_key: str | None = None,
         keypair_path: str | None = None,
+        timeout: float = 30.0,
+        retry_budget: float = 10.0,
     ):
         # Strip trailing slash so callers don't need to worry about formatting
         self.base_url = base_url.rstrip("/")
+        # Per-request socket timeout, in seconds. Without this urllib falls back to
+        # the system default, which can hang a caller (or an agent framework's worker
+        # thread) indefinitely on a stalled connection.
+        self.timeout = timeout
+        # Total wall-clock seconds to spend retrying 503s before giving up. Render
+        # cold starts need retries, but an unbounded retry loop blocks the calling
+        # thread — in an async agent that starves the executor pool and stalls every
+        # other tool call. Budgeting the total keeps a cold start recoverable while
+        # bounding the worst case.
+        self.retry_budget = retry_budget
         # In-session handle cache — stores the most recent server-minted transaction_id
         # so review() can be called with no arguments after call()
         self._last_handle: str | None = None
@@ -256,8 +269,11 @@ class AidressClient:
     def _post(self, path: str, payload: dict, _retries: int = 7, _bearer: str | None = None, _sign: bool = False, _x_payment: str | None = None, _mcp_session_id: str | None = None) -> tuple[int, dict]:
         """
         Send a POST request to the Aidress API and return (status_code, body).
-        Retries up to 7 times on 503 — cold starts can take up to 60 seconds;
-        we wait 5s between attempts (35s total headroom).
+        Retries on 503 (Render cold start) until either _retries attempts or the
+        client's retry_budget of wall-clock seconds is exhausted, whichever comes
+        first. The budget is what bounds the worst case: without it a cold start
+        blocks the calling thread for the full backoff, which starves the executor
+        pool when an async agent framework runs this client off a worker thread.
 
         _bearer:    if provided, attaches Authorization: Bearer header (Phase 1).
         _sign:      if True and no bearer key, signs with Ed25519 keypair (Phase 2).
@@ -281,17 +297,23 @@ class AidressClient:
             method="POST",
         )
         self.last_error = None  # clear stale diagnostics before this attempt
+        deadline = time.monotonic() + self.retry_budget
         for attempt in range(1, _retries + 1):
             try:
-                with urllib.request.urlopen(req) as resp:
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                     return resp.status, json.loads(resp.read().decode("utf-8"))
             except urllib.error.HTTPError as e:
                 # A reachable server that returned an error status — not a transport
                 # failure, so last_error stays cleared.
                 body = _parse_body(e.read(), e.code)
                 if e.code == 503 and attempt < _retries:
+                    # Sleep only as long as the remaining budget allows; stop retrying
+                    # once it is spent so the caller is never blocked past the budget.
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return e.code, body
                     print(f"  [Aidress] Server warming up, retrying ({attempt}/{_retries - 1})…")
-                    time.sleep(5)
+                    time.sleep(min(5, remaining))
                     continue
                 return e.code, body
             except urllib.error.URLError as e:
@@ -310,7 +332,7 @@ class AidressClient:
         )
         self.last_error = None  # clear stale diagnostics before this request
         try:
-            with urllib.request.urlopen(req) as resp:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 return resp.status, json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             return e.code, _parse_body(e.read(), e.code)
@@ -343,26 +365,45 @@ class AidressClient:
             return {"error": f"Agent '{agent_id}' not found in registry."}
         return body
 
-    def match(self, required_capabilities: list[str], settlement_rail: str | None = None) -> list[dict]:
+    def match(
+        self,
+        required_capabilities: list[str] | None = None,
+        settlement_rail: str | None = None,
+        org_name: str | None = None,
+        message_protocol: str | None = None,
+    ) -> list[dict]:
         """
-        Find agents that offer the capabilities you need, ranked by a composite
-        score (capability match + trust + success rate); best match first.
+        Find agents matching any combination of capability, settlement rail, org, or
+        message protocol, ranked by a composite score (capability match + trust +
+        success rate); best match first.
 
         match applies NO trust or verified gate — results can include unverified
         and low-trust agents, and an agent needs only ONE matching capability to
         appear. Always verify() a result before transacting with it.
 
-        settlement_rail — optional filter: "x402", "stripe", "manual", or omit for any.
+        All four filters are optional, but at least one is required (the server 422s
+        otherwise). Agents must match every filter you pass.
+        settlement_rail  — "x402", "stripe", "manual", or omit for any.
+        org_name         — exact match, case-insensitive.
+        message_protocol — "a2a", "mcp", or "raw" — restrict to agents whose endpoint
+                           speaks this format.
         Returns a list of trust objects — empty list if nothing matches.
 
         Usage:
             agents = client.match(["freight_booking", "customs_clearance"])
             agents = client.match(["seo_optimization"], settlement_rail="x402")
+            agents = client.match(org_name="Acme Corp")
             best   = agents[0] if agents else None
         """
-        payload: dict = {"required_capabilities": required_capabilities}
+        payload: dict = {}
+        if required_capabilities:
+            payload["required_capabilities"] = required_capabilities
         if settlement_rail:
             payload["settlement_rail"] = settlement_rail
+        if org_name:
+            payload["org_name"] = org_name
+        if message_protocol:
+            payload["message_protocol"] = message_protocol
         status, body = self._post("/match", payload)
         if status == 0 or not isinstance(body, list):
             return []
@@ -533,6 +574,7 @@ class AidressClient:
         org_name:               str | None = None,
         org_domain:             str | None = None,
         contact_info:           str | None = None,
+        contact_email:          str | None = None,
         capabilities:           list | None = None,
         endpoint_url:           str | None = None,
         protocol:               str | None = None,
@@ -548,6 +590,10 @@ class AidressClient:
         auth_header_name:       str | None = None,
         capability_confirmations: dict | None = None,
         candidate_matches:      dict | None = None,
+        price_schedule:         list | None = None,
+        payment_network:        str | None = None,
+        payment_pay_to:         str | None = None,
+        payment_asset:          str | None = None,
     ) -> dict:
         """
         Register a new agent with the Aidress registry.
@@ -556,8 +602,19 @@ class AidressClient:
         are required for routable agents (those that accept calls); human/observer
         registrations can omit them.
 
-        Returns the registration response on success (includes a one-time agent_key),
-        or a dict with an "error" key if the agent_id or org_domain is taken.
+        contact_email is REQUIRED unless this request is authenticated with an org
+        X-API-KEY (this client has no way to send one) or Authorization: Bearer
+        <ADMIN_KEY>.
+
+        TEMPORARY (short-term server-side change): agent_key is currently NEVER returned
+        directly here, even with ADMIN_KEY — the response instead has a claim_link (and
+        agent_key: None) regardless of credentials. Pass the token from that link
+        (everything after "token=") to claim() to actually mint and receive the key. This
+        will revert to the documented ADMIN_KEY-bypasses-straight-to-a-key behavior above
+        once the server side does.
+
+        Returns the registration response — a dict with a claim_link field to pass to
+        claim(), or a dict with an "error" key if the agent_id or org_domain is taken.
 
         Capability weight tiers (weights represent specificity):
             weight 3 (USP / most specific) — max 1 capability
@@ -565,6 +622,14 @@ class AidressClient:
             weight 1 (generic / supporting)— max 3 capabilities
         Maximum 6 capabilities total. Pass plain strings (default weight 1, generic) or dicts:
             capabilities=[{"name": "freight_booking", "weight": 3}, "customs_clearance"]
+
+        price_schedule declares per-task pricing upfront, e.g.
+            [{"task": "search", "price": 0.01}, {"task": "deep_research", "price": 0.4}]
+        so callers can pay you on their FIRST call instead of discovering your price
+        through a live 402 — surfaced via verify()/match() as routing.price_schedule +
+        routing.pay_via. Requires payment_network/payment_pay_to/payment_asset in the
+        SAME call. Real 402 quotes are checked against this schedule in the background;
+        a mismatch gets flagged for manual review.
 
         Usage:
             result = client.register(
@@ -577,6 +642,7 @@ class AidressClient:
         if org_name is not None:               body["org_name"]               = org_name
         if org_domain is not None:             body["org_domain"]             = org_domain
         if contact_info is not None:           body["contact_info"]           = contact_info
+        if contact_email is not None:          body["contact_email"]          = contact_email
         if capabilities is not None:           body["capabilities"]           = capabilities
         if endpoint_url is not None:           body["endpoint_url"]           = endpoint_url
         if protocol is not None:               body["protocol"]               = protocol
@@ -590,17 +656,165 @@ class AidressClient:
         if auth_header_name is not None:       body["auth_header_name"]       = auth_header_name
         if capability_confirmations is not None: body["capability_confirmations"] = capability_confirmations
         if candidate_matches is not None:      body["candidate_matches"]      = candidate_matches
+        if price_schedule is not None:         body["price_schedule"]         = price_schedule
+        if payment_network is not None:        body["payment_network"]        = payment_network
+        if payment_pay_to is not None:         body["payment_pay_to"]         = payment_pay_to
+        if payment_asset is not None:          body["payment_asset"]          = payment_asset
         body["message_protocol"] = message_protocol
         body["a2a_compliant"]    = a2a_compliant
 
-        status, resp = self._post("/register", body)
+        # _bearer=self._agent_key: this client has no way to send an org X-API-KEY, but the
+        # same Authorization: Bearer slot IS how ADMIN_KEY authenticates on this endpoint —
+        # set agent_key to a real ADMIN_KEY (constructor param or set_agent_key()) to skip
+        # the claim-token email and get agent_key back directly, same as register()'s docstring
+        # above promises.
+        # Authenticate with whatever credential (if any) was already set, before capturing
+        # anything back — otherwise capturing the response's agent_key below would silently
+        # overwrite that same credential (e.g. an ADMIN_KEY used to bypass the email step),
+        # breaking any further admin-authenticated calls in this session.
+        had_credential = bool(self._agent_key)
+        status, resp = self._post("/register", body, _bearer=self._agent_key)
         if status == 0:
             return dict(_UNREACHABLE)
         if status == 409:
             return {"error": resp.get("detail", "Agent or domain already registered")}
-        # Capture the one-time bearer key so subsequent mutating calls are auth'd automatically
+        # Capture the one-time bearer key so subsequent mutating calls are auth'd automatically —
+        # only when this call established a NEW identity from scratch (no prior credential).
+        if not had_credential and isinstance(resp, dict) and resp.get("agent_key"):
+            self._agent_key = resp["agent_key"]
+        return resp
+
+    def rotate(self, agent_id: str) -> dict:
+        """
+        Request rotation of agent_id's bearer key — the previous key stops working the
+        moment the new one is actually claimed (see claim()).
+
+        Requires either an org X-API-KEY (this client has no way to send one) or
+        Authorization: Bearer <ADMIN_KEY> (agent_key set to a real admin key, via the
+        constructor or set_agent_key()) to skip a check that this agent has a contact_email
+        on file — that check is skipped for org/admin, required otherwise (400 if missing).
+
+        TEMPORARY (short-term server-side change): agent_key is currently NEVER returned
+        directly here, even with ADMIN_KEY — the response instead has a claim_link (and
+        agent_key: None) regardless of credentials. Pass the token from that link
+        (everything after "token=") to claim() to actually mint and receive the key.
+
+        Returns a dict with an "error" key if agent_id doesn't exist (404), has no
+        contact_email on file and no org/admin credential was used (400), or a claim
+        link was requested too recently for this agent (429).
+
+        from aidress_sdk import rotate, claim
+        result = rotate("my_agent_01")
+        token = result["claim_link"].rsplit("token=", 1)[-1]
+        claim(token)
+        """
+        status, resp = self._post("/rotate", {"agent_id": agent_id}, _bearer=self._agent_key)
+        if status == 0:
+            return dict(_UNREACHABLE)
+        if status in (400, 404, 429):
+            return {"error": resp.get("detail", "Could not start key rotation")}
+        return resp
+
+    def claim(self, token: str) -> dict:
+        """
+        Redeem a claim-token link's token (from register()'s or rotate()'s claim_link field)
+        and receive the actual bearer key. This is the GET /rotate?token=... step — the only
+        place a key is currently minted (see the TEMPORARY notes on register()/rotate()).
+
+        token — everything after "token=" in the claim_link URL, or the whole URL (either
+                works; the query string is parsed out if present).
+
+        Auto-captures the returned key into this client (like register() normally does), so
+        subsequent update()/call()/review() calls authenticate automatically.
+
+        Returns a dict with an "error" key if the token is invalid or already used (400).
+
+        from aidress_sdk import claim
+        result = claim("eyJhbGc...")           # raw token
+        result = claim("https://api.aidress.ai/rotate?token=eyJhbGc...")  # or the full link
+        """
+        if "token=" in token:
+            token = token.rsplit("token=", 1)[-1]
+        status, resp = self._get(f"/rotate?token={urllib.parse.quote(token, safe='')}")
+        if status == 0:
+            return dict(_UNREACHABLE)
+        if status == 400:
+            return {"error": resp.get("detail", "Claim link is invalid or already used")}
         if isinstance(resp, dict) and resp.get("agent_key"):
             self._agent_key = resp["agent_key"]
+        return resp
+
+    def update(
+        self,
+        agent_id:               str,
+        org_name:               str | None = None,
+        org_domain:             str | None = None,
+        contact_info:           str | None = None,
+        contact_email:          str | None = None,
+        capabilities:           list | None = None,
+        specialty:              str | None = None,
+        endpoint_url:           str | None = None,
+        protocol:               str | None = None,
+        accepted_terms_format:  str | None = None,
+        settlement_rail:        str | None = None,
+        payload_schema:         dict | None = None,
+        message_protocol:       str | None = None,
+        signup_help:            str | None = None,
+        auth_header_name:       str | None = None,
+        a2a_compliant:          bool | None = None,
+        accepted_content_types: list[str] | None = None,
+        http_methods:           list[str] | None = None,
+        public_key:             str | None = None,
+        price_schedule:         list | None = None,
+        payment_network:        str | None = None,
+        payment_pay_to:         str | None = None,
+        payment_asset:          str | None = None,
+    ) -> dict:
+        """
+        Update an existing agent's profile. Only the fields you pass are changed;
+        omitted fields are left untouched. contact_email is where /rotate's claim-token
+        link is sent when this agent's key is rotated without an org/admin credential.
+
+        Requires a bearer key (agent_key=/set_agent_key()) or a configured keypair,
+        and it must match agent_id — the same auth as call() and review().
+
+        Returns the updated agent profile, or a dict with an "error" key if the
+        agent is not found or the caller is not authorised to change it.
+
+        Usage:
+            client.update("my_agent_01", specialty="freight brokerage", settlement_rail="x402")
+        """
+        body: dict = {"agent_id": agent_id}
+        if org_name is not None:               body["org_name"]               = org_name
+        if org_domain is not None:             body["org_domain"]             = org_domain
+        if contact_info is not None:           body["contact_info"]           = contact_info
+        if contact_email is not None:          body["contact_email"]          = contact_email
+        if capabilities is not None:           body["capabilities"]           = capabilities
+        if specialty is not None:              body["specialty"]              = specialty
+        if endpoint_url is not None:           body["endpoint_url"]           = endpoint_url
+        if protocol is not None:               body["protocol"]               = protocol
+        if accepted_terms_format is not None:  body["accepted_terms_format"]  = accepted_terms_format
+        if settlement_rail is not None:        body["settlement_rail"]        = settlement_rail
+        if payload_schema is not None:         body["payload_schema"]         = payload_schema
+        if message_protocol is not None:       body["message_protocol"]       = message_protocol
+        if signup_help is not None:            body["signup_help"]            = signup_help
+        if auth_header_name is not None:       body["auth_header_name"]       = auth_header_name
+        if a2a_compliant is not None:          body["a2a_compliant"]          = a2a_compliant
+        if accepted_content_types is not None: body["accepted_content_types"] = accepted_content_types
+        if http_methods is not None:           body["http_methods"]           = http_methods
+        if public_key is not None:             body["public_key"]             = public_key
+        if price_schedule is not None:         body["price_schedule"]         = price_schedule
+        if payment_network is not None:        body["payment_network"]        = payment_network
+        if payment_pay_to is not None:         body["payment_pay_to"]         = payment_pay_to
+        if payment_asset is not None:          body["payment_asset"]          = payment_asset
+
+        status, resp = self._post("/update", body, _bearer=self._agent_key, _sign=True)
+        if status == 0:
+            return dict(_UNREACHABLE)
+        if status == 404:
+            return {"error": f"Agent '{agent_id}' not found"}
+        if status in (401, 403):
+            return {"error": resp.get("detail", "Not authorised to update this agent")}
         return resp
 
     def get_agent(self, agent_id: str) -> dict:
@@ -674,16 +888,23 @@ def verify(agent_id: str) -> dict:
     return _default_client.verify(agent_id)
 
 
-def match(required_capabilities: list[str], settlement_rail: str | None = None) -> list[dict]:
+def match(
+    required_capabilities: list[str] | None = None,
+    settlement_rail: str | None = None,
+    org_name: str | None = None,
+    message_protocol: str | None = None,
+) -> list[dict]:
     """
-    Find agents that can handle the capabilities you need (no trust gate —
-    verify() each result before transacting).
+    Find agents matching capability, settlement rail, org, and/or message protocol
+    (no trust gate — verify() each result before transacting). At least one filter
+    is required. See AidressClient.match for full details.
 
     from aidress_sdk import match
     agents = match(["freight_booking", "customs_clearance"])
     agents = match(["seo_optimization"], settlement_rail="x402")
+    agents = match(org_name="Acme Corp")
     """
-    return _default_client.match(required_capabilities, settlement_rail)
+    return _default_client.match(required_capabilities, settlement_rail, org_name, message_protocol)
 
 
 def call(
@@ -801,6 +1022,7 @@ def register(
     org_name:               str | None = None,
     org_domain:             str | None = None,
     contact_info:           str | None = None,
+    contact_email:          str | None = None,
     capabilities:           list | None = None,
     endpoint_url:           str | None = None,
     protocol:               str | None = None,
@@ -816,6 +1038,10 @@ def register(
     auth_header_name:       str | None = None,
     capability_confirmations: dict | None = None,
     candidate_matches:      dict | None = None,
+    price_schedule:         list | None = None,
+    payment_network:        str | None = None,
+    payment_pay_to:         str | None = None,
+    payment_asset:          str | None = None,
 ) -> dict:
     """
     Register a new agent with Aidress. Automatically sets the bearer key on the
@@ -827,6 +1053,7 @@ def register(
     """
     return _default_client.register(
         agent_id, org_name=org_name, org_domain=org_domain, contact_info=contact_info,
+        contact_email=contact_email,
         capabilities=capabilities, endpoint_url=endpoint_url, protocol=protocol,
         accepted_terms_format=accepted_terms_format, settlement_rail=settlement_rail,
         http_methods=http_methods, specialty=specialty, public_key=public_key,
@@ -834,7 +1061,76 @@ def register(
         accepted_content_types=accepted_content_types, signup_help=signup_help,
         auth_header_name=auth_header_name, capability_confirmations=capability_confirmations,
         candidate_matches=candidate_matches,
+        price_schedule=price_schedule, payment_network=payment_network,
+        payment_pay_to=payment_pay_to, payment_asset=payment_asset,
     )
+
+
+def update(
+    agent_id:               str,
+    org_name:               str | None = None,
+    org_domain:             str | None = None,
+    contact_info:           str | None = None,
+    contact_email:          str | None = None,
+    capabilities:           list | None = None,
+    specialty:              str | None = None,
+    endpoint_url:           str | None = None,
+    protocol:               str | None = None,
+    accepted_terms_format:  str | None = None,
+    settlement_rail:        str | None = None,
+    payload_schema:         dict | None = None,
+    message_protocol:       str | None = None,
+    signup_help:            str | None = None,
+    auth_header_name:       str | None = None,
+    a2a_compliant:          bool | None = None,
+    accepted_content_types: list[str] | None = None,
+    http_methods:           list[str] | None = None,
+    public_key:             str | None = None,
+    price_schedule:         list | None = None,
+    payment_network:        str | None = None,
+    payment_pay_to:         str | None = None,
+    payment_asset:          str | None = None,
+) -> dict:
+    """
+    Update an existing agent's profile. Only the fields you pass are changed.
+
+    Requires a bearer key. Either call register() first (key is auto-captured)
+    or call set_agent_key("aidress-agent-sk-…") once before updating.
+
+    from aidress_sdk import set_agent_key, update
+    set_agent_key("aidress-agent-sk-…")
+    update("my_agent_01", specialty="freight brokerage")
+    """
+    return _default_client.update(
+        agent_id, org_name, org_domain, contact_info, contact_email, capabilities, specialty,
+        endpoint_url, protocol, accepted_terms_format, settlement_rail,
+        payload_schema, message_protocol, signup_help, auth_header_name,
+        a2a_compliant, accepted_content_types, http_methods, public_key,
+        price_schedule, payment_network, payment_pay_to, payment_asset,
+    )
+
+
+def rotate(agent_id: str) -> dict:
+    """
+    Request rotation of an agent's bearer key on the default client. Returns a claim_link —
+    pass its token to claim() to actually receive the new key. See AidressClient.rotate.
+
+    from aidress_sdk import rotate, claim
+    result = rotate("my_agent_01")
+    claim(result["claim_link"])
+    """
+    return _default_client.rotate(agent_id)
+
+
+def claim(token: str) -> dict:
+    """
+    Redeem a claim-token link (or its raw token) on the default client and receive the
+    actual bearer key. See AidressClient.claim.
+
+    from aidress_sdk import claim
+    claim("https://api.aidress.ai/rotate?token=eyJhbGc...")
+    """
+    return _default_client.claim(token)
 
 
 def get_agent(agent_id: str) -> dict:
@@ -875,19 +1171,11 @@ if __name__ == "__main__":
     print("  Aidress SDK — integration demo")
     print("═" * 55)
 
-    # ── verify() ─────────────────────────────────────────────────────────────
-    print("\n── verify('agent_freightbot_01') ──")
-    trust = verify("agent_freightbot_01")
-    print(f"  agent_id    : {trust.get('agent_id')}")
-    print(f"  org_name    : {trust.get('org_name')}")
-    print(f"  verified    : {trust.get('verified')}")
-    print(f"  trust_score : {trust.get('trust_score')}/100")
-    print(f"  capabilities: {trust.get('capabilities', [])}")
-    print(f"  flags       : {trust.get('flags', []) or 'none'}")
-
     # ── match() ───────────────────────────────────────────────────────────────
-    print("\n── match(['freight_booking']) ──")
-    agents = match(["freight_booking"])
+    # Resolve a live agent_id here rather than hardcoding one — registry contents
+    # change over time and ids do get withdrawn.
+    print("\n── match(['web research']) ──")
+    agents = match(["web research"])
     if agents:
         best = agents[0]
         print(f"  {len(agents)} agent(s) matched. Top result:")
@@ -898,34 +1186,67 @@ if __name__ == "__main__":
     else:
         print("  No agents matched.")
 
+    # ── verify() ─────────────────────────────────────────────────────────────
+    target = agents[0]["agent_id"] if agents else None
+    print(f"\n── verify({target!r}) ──")
+    trust = verify(target) if target else {}
+    print(f"  agent_id    : {trust.get('agent_id')}")
+    print(f"  org_name    : {trust.get('org_name')}")
+    print(f"  verified    : {trust.get('verified')}")
+    print(f"  trust_score : {trust.get('trust_score')}/100")
+    print(f"  transactions: {trust.get('transaction_count')}")
+    print(f"  capabilities: {trust.get('capabilities', [])}")
+    print(f"  flags       : {trust.get('flags', []) or 'none'}")
+
     # ── registry() ───────────────────────────────────────────────────────────
     print("\n── registry() ──")
     all_agents = registry()
     print(f"  {len(all_agents)} trusted agent(s) in registry.")
 
-    # ── call() + review() (handle auto-fill, bearer-authenticated) ──────────────
-    # Register a fresh demo agent to get a bearer key, then use call() + review().
-    print("\n── register demo agent → bearer key → call() → review() ──")
-    import time as _time
-    demo_id = f"sdk_demo_{int(_time.time())}"
-    demo_client = AidressClient()
-    reg = demo_client.register(demo_id, "SDK Demo Corp", f"{demo_id}.example.com", "demo@example.com")
-    if reg.get("agent_key"):
-        print(f"  registered : {demo_id}")
-        print(f"  agent_key  : {reg['agent_key'][:28]}… (truncated)")
-        called = demo_client.call("agent_freightbot_01", {"action": "demo"}, caller_agent_id=demo_id)
-        if called.get("transaction_id") or called.get("review_reminder"):
-            txn = called.get("transaction_id") or called.get("review_reminder", {}).get("transaction_id")
-            print(f"  handle     : {txn}")
-            result = demo_client.review(success=True, score=9, caller_agent_id=demo_id)
-            if result.get("error"):
-                print(f"  review note: {result['error']}")
-            else:
-                print(f"  receiver trust_score after review: {result.get('trust_score')}/100")
-        else:
-            print(f"  call result: {called}")
+    # ── register() → claim() → call() → review() ────────────────────────────────
+    # register() returns a claim_link, not a key; claim() redeems it and captures
+    # the minted key into the client so call()/review() authenticate themselves.
+    # This branch mutates the registry, so it only runs with WRITE=1 set.
+    if not os.environ.get("WRITE"):
+        print("\n── register → claim → call → review  (set WRITE=1 to run) ──")
+    elif not target:
+        print("\n── register → claim → call → review  (skipped: no live target) ──")
     else:
-        print(f"  register error: {reg}")
+        print("\n── register demo agent → claim key → call() → review() ──")
+        import time as _time
+        demo_id = f"sdk_demo_{int(_time.time())}"
+        demo_client = AidressClient()
+        reg = demo_client.register(
+            demo_id,
+            org_name="SDK Demo Corp",
+            org_domain=f"{demo_id}.example.com",
+            contact_email="demo@example.com",
+            endpoint_url="https://example.com/agent",
+        )
+        if reg.get("error") or not reg.get("claim_link"):
+            print(f"  register error: {reg.get('error') or reg}")
+        else:
+            print(f"  registered : {demo_id}")
+            print(f"  claim_link : {str(reg['claim_link'])[:52]}…")
+            claimed = demo_client.claim(reg["claim_link"])
+            if claimed.get("error") or not claimed.get("agent_key"):
+                print(f"  claim error: {claimed.get('error') or claimed}")
+            else:
+                print(f"  agent_key  : {claimed['agent_key'][:28]}… (truncated, single-use link)")
+                called = demo_client.call(
+                    target, {"query": "demo"}, caller_agent_id=demo_id,
+                    message_protocol=trust.get("message_protocol"),
+                )
+                txn = called.get("transaction_id") or (called.get("review_reminder") or {}).get("transaction_id")
+                if txn:
+                    print(f"  handle     : {txn}")
+                    result = demo_client.review(success=True, score=9, caller_agent_id=demo_id)
+                    if result.get("error"):
+                        print(f"  review note: {result['error']}")
+                    else:
+                        print(f"  receiver trust_score after review: {result.get('trust_score')}/100")
+                else:
+                    print(f"  call result: {called}")
 
     print("\n" + "═" * 55)
     print("  That's the full integration — handles mint themselves.")

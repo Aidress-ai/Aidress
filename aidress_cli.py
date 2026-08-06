@@ -421,6 +421,8 @@ _SPINNER_MSGS = {
     "registry": "Loading registry…",
     "import":   "Importing agent card…",
     "register": "Registering agent…",
+    "rotate":   "Rotating bearer key…",
+    "claim":    "Claiming bearer key…",
     "call":     "Calling agent…",
     "review":   "Submitting review…",
     "schema":   "Fetching payload schema…",
@@ -433,6 +435,8 @@ _RENDERERS = {
     "registry": _render_registry,
     "import":   _render_import,
     "register": _render_register,
+    "rotate":   _render_register,
+    "claim":    _render_register,
     "call":     _render_call,
     "review":   _render_review,
     "schema":   _render_schema,
@@ -516,9 +520,15 @@ def _cmd_verify(client: AidressClient, args) -> int:
 
 
 def _cmd_match(client: AidressClient, args) -> int:
+    if not (args.capabilities or args.rail or args.org_name or args.message_protocol):
+        console.print("[red]error: match needs at least one filter — capabilities, --rail, --org-name, or --message-protocol[/red]")
+        return 2
     _, code = _run_with_spinner(
         "match",
-        lambda: client.match(args.capabilities, settlement_rail=args.rail),
+        lambda: client.match(
+            args.capabilities, settlement_rail=args.rail,
+            org_name=args.org_name, message_protocol=args.message_protocol,
+        ),
         client, args.json,
     )
     return code
@@ -548,6 +558,14 @@ def _cmd_register(client: AidressClient, args) -> int:
     caps = args.capabilities.split(",") if args.capabilities else None
     http_methods = args.http_methods.split(",") if args.http_methods else None
     act = args.accepted_content_types.split(",") if args.accepted_content_types else None
+    if args.price_schedule:
+        try:
+            price_schedule = json.loads(args.price_schedule)
+        except json.JSONDecodeError as e:
+            console.print(f"[red]error: --price-schedule is not valid JSON: {e}[/red]")
+            return 2
+    else:
+        price_schedule = None
     _, code = _run_with_spinner(
         "register",
         lambda: client.register(
@@ -555,6 +573,7 @@ def _cmd_register(client: AidressClient, args) -> int:
             org_name=args.org_name,
             org_domain=args.org_domain,
             contact_info=args.contact_info,
+            contact_email=args.contact_email,
             capabilities=caps,
             endpoint_url=args.endpoint_url,
             protocol=args.protocol,
@@ -568,9 +587,23 @@ def _cmd_register(client: AidressClient, args) -> int:
             accepted_content_types=act,
             signup_help=args.signup_help,
             auth_header_name=args.auth_header_name,
+            price_schedule=price_schedule,
+            payment_network=args.payment_network,
+            payment_pay_to=args.payment_pay_to,
+            payment_asset=args.payment_asset,
         ),
         client, args.json,
     )
+    return code
+
+
+def _cmd_rotate(client: AidressClient, args) -> int:
+    _, code = _run_with_spinner("rotate", lambda: client.rotate(args.agent_id), client, args.json)
+    return code
+
+
+def _cmd_claim(client: AidressClient, args) -> int:
+    _, code = _run_with_spinner("claim", lambda: client.claim(args.token), client, args.json)
     return code
 
 
@@ -799,7 +832,8 @@ def _build_parser() -> _RichParser:
             "  --url URL   API base URL  (default: https://api.aidress.ai)\n"
             "  --key KEY   agent key for write commands (or set AIDRESS_AGENT_KEY)\n"
             "  --json      raw JSON output instead of the rich UI\n"
-            "  --no-banner suppress the startup logo\n\n"
+            "  --no-banner suppress the startup logo\n"
+            "  --version   print the installed version and exit\n\n"
             "run 'aidress formats' for a full command reference card."
         ),
         formatter_class=_Fmt,
@@ -808,6 +842,10 @@ def _build_parser() -> _RichParser:
     parser.add_argument("--key", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--json", action="store_true", default=False, help=argparse.SUPPRESS)
     parser.add_argument("--no-banner", action="store_true", default=False, help=argparse.SUPPRESS)
+    # action="version" short-circuits before the required-subcommand check, so
+    # `aidress --version` works with no command supplied.
+    parser.add_argument("--version", action="version", version=f"aidress {_CLI_VERSION}",
+                        help=argparse.SUPPRESS)
 
     sub = parser.add_subparsers(dest="command", required=True, metavar="<command>",
                                 parser_class=_RichParser)
@@ -826,14 +864,26 @@ def _build_parser() -> _RichParser:
     # match
     p = sub.add_parser(
         "match",
-        help="find trusted agents by capability",
-        description="Search the registry for agents that support all requested capabilities,\nranked by composite score (capability fit × trust × success rate).",
-        epilog="example:\n  aidress match freight_booking customs_clearance --rail x402",
+        help="find trusted agents by capability, org, rail, and/or message protocol",
+        description=(
+            "Search the registry for agents matching any combination of capability,\n"
+            "settlement rail, org name, and message protocol — ranked by composite\n"
+            "score (capability fit × trust × success rate). At least one filter is required."
+        ),
+        epilog=(
+            "example:\n"
+            "  aidress match freight_booking customs_clearance --rail x402\n"
+            "  aidress match --org-name \"Acme Corp\"\n"
+            "  aidress match --message-protocol mcp"
+        ),
         formatter_class=_Fmt,
     )
-    p.add_argument("capabilities", nargs="+", help="one or more capability names")
+    p.add_argument("capabilities", nargs="*", help="capability names (optional if --org-name/--rail/--message-protocol given)")
     p.add_argument("--rail", default=None, choices=["x402", "stripe", "manual"],
                    help="only return agents that support this settlement rail")
+    p.add_argument("--org-name", dest="org_name", default=None, help="only return agents from this org (exact match, case-insensitive)")
+    p.add_argument("--message-protocol", dest="message_protocol", default=None, choices=["a2a", "mcp", "raw"],
+                   help="only return agents whose endpoint speaks this message format")
     p.set_defaults(func=_cmd_match)
 
     # get
@@ -891,11 +941,12 @@ def _build_parser() -> _RichParser:
     # register
     p = sub.add_parser(
         "register",
-        usage="aidress --key KEY register <agent_id> [options]",
-        help="register a new agent (requires --key)",
+        usage="aidress register <agent_id> [options]",
+        help="register a new agent",
         description=(
-            "Register a new agent. Returns a bearer key you must save — it won't be shown again.\n"
-            "Requires --key (or AIDRESS_AGENT_KEY env var)."
+            "Register a new agent. Returns a claim_link, NOT a key — run\n"
+            "`aidress claim <link>` to mint the bearer key, then save it.\n"
+            "No credential needed, but --contact-email is required without one."
         ),
         epilog=(
             "capability weights (--capabilities):\n"
@@ -905,10 +956,12 @@ def _build_parser() -> _RichParser:
             "  max 6 capabilities total\n"
             "  to set weight: '{\"name\":\"freight_booking\",\"weight\":3}'\n\n"
             "example:\n"
-            "  aidress --key sk-... register my_agent \\\n"
+            "  aidress register my_agent \\\n"
             "    --org-name Acme --org-domain acme.com \\\n"
+            "    --contact-email agent@acme.com \\\n"
             "    --capabilities freight_booking,shipment_tracking \\\n"
-            "    --settlement-rail x402 --endpoint-url https://acme.com/agent"
+            "    --settlement-rail x402 --endpoint-url https://acme.com/agent\n"
+            "  aidress claim \"<claim_link from above>\""
         ),
         formatter_class=_Fmt,
     )
@@ -916,6 +969,7 @@ def _build_parser() -> _RichParser:
     p.add_argument("--org-name",               dest="org_name",      default=None, help="your organisation's display name")
     p.add_argument("--org-domain",             dest="org_domain",    default=None, help="your organisation's domain (e.g. acme.com)")
     p.add_argument("--contact-info",           dest="contact_info",  default=None, help="email, Twitter handle, or GitHub URL")
+    p.add_argument("--contact-email",          dest="contact_email", default=None, help="required unless --key is an org/admin credential — a one-time claim link for the bearer key is emailed here instead of being returned directly")
     p.add_argument("--endpoint-url",           dest="endpoint_url",  default=None, help="public HTTPS URL callers should route to")
     p.add_argument("--capabilities",           dest="capabilities",  default=None, help="comma-separated capability names or JSON dicts with weights")
     p.add_argument("--specialty",              dest="specialty",     default=None, help="one-line description of what this agent specialises in")
@@ -929,7 +983,48 @@ def _build_parser() -> _RichParser:
     p.add_argument("--public-key",             dest="public_key",    default=None, help="Ed25519 public key in base64url for payload verification")
     p.add_argument("--signup-help",            dest="signup_help",   default=None, help="URL or instructions for callers to get a credential")
     p.add_argument("--auth-header-name",       dest="auth_header_name", default=None, help="header name callers must supply (e.g. X-Api-Key)")
+    p.add_argument("--price-schedule",         dest="price_schedule", default=None, help='JSON array of per-task prices, e.g. \'[{"task":"search","price":0.01}]\' — requires --payment-network/--payment-pay-to/--payment-asset')
+    p.add_argument("--payment-network",        dest="payment_network", default=None, help="CAIP-2 network your price_schedule pays out on, e.g. eip155:8453")
+    p.add_argument("--payment-pay-to",         dest="payment_pay_to", default=None, help="your receiving wallet address")
+    p.add_argument("--payment-asset",          dest="payment_asset", default=None, help="asset contract address you accept (e.g. USDC's contract)")
     p.set_defaults(func=_cmd_register)
+
+    # rotate
+    p = sub.add_parser(
+        "rotate",
+        usage="aidress rotate <agent_id>",
+        help="request rotation of an agent's bearer key",
+        description=(
+            "Request rotation of an agent's bearer key; the previous key stops working the\n"
+            "moment the new one is actually claimed. TEMPORARILY, this never returns the new\n"
+            "key directly (even with an org/admin credential) — the response has a claim_link\n"
+            "instead. Run `aidress claim <link-or-token>` to finish and receive the new key."
+        ),
+        epilog="example:\n  aidress rotate my_agent\n  aidress claim \"<claim_link from above>\"",
+        formatter_class=_Fmt,
+    )
+    p.add_argument("agent_id", help="the agent whose bearer key to rotate")
+    p.set_defaults(func=_cmd_rotate)
+
+    # claim
+    p = sub.add_parser(
+        "claim",
+        usage="aidress claim <token-or-link>",
+        help="redeem a claim link and receive the actual bearer key",
+        description=(
+            "Redeem a claim_link's token (from `register` or `rotate`) and receive the real\n"
+            "bearer key. This is the step that actually mints the key — register/rotate only\n"
+            "hand back a link right now."
+        ),
+        epilog=(
+            "example:\n"
+            "  aidress claim eyJhbGc...\n"
+            "  aidress claim \"https://api.aidress.ai/rotate?token=eyJhbGc...\""
+        ),
+        formatter_class=_Fmt,
+    )
+    p.add_argument("token", help="the claim token, or the full claim_link URL")
+    p.set_defaults(func=_cmd_claim)
 
     # call
     p = sub.add_parser(
@@ -977,7 +1072,10 @@ def _build_parser() -> _RichParser:
     return parser
 
 
-_CLI_VERSION = "0.2.3"
+# Must track [project].version in packaging/aidress-sdk/pyproject.toml — the CLI ships in
+# that package, so a mismatch makes `aidress --version` lie. release.sh rewrites both.
+# Also keys the once-per-version banner sentinel below, so a bump re-shows the banner.
+_CLI_VERSION = "0.4.0"
 _SENTINEL = Path.home() / ".aidress" / f".banner_shown_{_CLI_VERSION}"
 
 
