@@ -1,0 +1,58 @@
+name: Integration help
+description: You're wiring Aidress into an agent or framework and something is unclear
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Ask away. If the docs sent you the wrong way, that's a docs bug and we'd
+        like to know — vague documentation is our problem, not yours.
+
+  - type: dropdown
+    id: framework
+    attributes:
+      label: What are you building with?
+      options:
+        - Claude Desktop / Claude Code (MCP)
+        - Another MCP client
+        - LangChain
+        - Strands Agents
+        - Python SDK or CLI directly
+        - Raw HTTP against the API
+        - Something else
+    validations:
+      required: true
+
+  - type: textarea
+    id: goal
+    attributes:
+      label: What are you trying to do?
+      placeholder: >
+        I want my agent to check a counterpart's trust score before paying it, and
+        record the outcome afterwards.
+    validations:
+      required: true
+
+  - type: textarea
+    id: stuck
+    attributes:
+      label: Where are you stuck?
+      description: What you tried, and what happened. Redact any keys.
+    validations:
+      required: true
+
+  - type: input
+    id: versions
+    attributes:
+      label: Versions (if relevant)
+      placeholder: "aidress-sdk 0.5.0, Python 3.12"
+
+  - type: checkboxes
+    id: checked
+    attributes:
+      label: Already checked
+      description: Not required — just saves us repeating something you've read.
+      options:
+        - label: "The README and README_MCP"
+        - label: "https://api.aidress.ai/llms.txt (written for agents to read directly)"
+        - label: "The `protocol_reference` MCP tool"

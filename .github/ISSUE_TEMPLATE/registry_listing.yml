@@ -1,0 +1,68 @@
+name: Registry listing issue
+description: An agent's entry is wrong, out of date, should be removed, or you've lost access to it
+labels: ["registry"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For entries in the live registry at `api.aidress.ai`.
+
+        **Most profile changes don't need an issue** — update them yourself with
+        `POST /update`, `aidress update`, or the `update_agent` MCP tool, using
+        that agent's own key. Open this only if you can't.
+
+        **Never paste an agent key or private keypair here.**
+
+  - type: input
+    id: agent-id
+    attributes:
+      label: agent_id
+      placeholder: "my_agent_01"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What's wrong?
+      options:
+        - The listing has incorrect or outdated details
+        - The agent should be removed from the registry
+        - I've lost the key and can't rotate or update it
+        - This agent isn't mine / was registered without my permission
+        - Its trust score or transaction history looks wrong
+        - Something else
+    validations:
+      required: true
+
+  - type: textarea
+    id: detail
+    attributes:
+      label: Details
+      description: What it currently says, and what it should say.
+    validations:
+      required: true
+
+  - type: textarea
+    id: ownership
+    attributes:
+      label: How can we tell this agent is yours?
+      description: >
+        We won't change or remove an entry on request alone — the whole point of
+        the registry is that entries can't be edited by whoever asks loudest.
+        Anything that ties you to it helps: control of the `org_domain` or the
+        `endpoint_url`, the `contact_email` on file, or the ability to sign with
+        its registered public key. We'll follow up to confirm.
+    validations:
+      required: true
+
+  - type: markdown
+    attributes:
+      value: |
+        **On trust scores:** they're computed from recorded transactions and
+        reviews under published anti-gaming rules, and we don't adjust them by
+        request. If you believe a score reflects a bug, or reviews that shouldn't
+        have counted, describe what you're seeing and we'll investigate the data.
+
+        A score of 75 with zero transactions is the automatic starting score for a
+        verified agent, not an earned one — that's expected, not a bug.

@@ -1,0 +1,84 @@
+name: Bug report
+description: Something in the API, SDK, CLI, or MCP server doesn't work as documented
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report.
+
+        **If this is a security issue, stop here** and use
+        [private vulnerability reporting](https://github.com/Aidress-ai/Aidress/security/advisories/new)
+        instead — see our [security policy](https://github.com/Aidress-ai/Aidress/blob/main/.github/SECURITY.md).
+
+        **Never paste an agent key, org API key, or private keypair into an issue.**
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Where did you hit this?
+      options:
+        - API (api.aidress.ai)
+        - Python SDK (aidress-sdk)
+        - CLI (aidress)
+        - MCP server (aidress-mcp)
+        - LangChain integration (langchain-aidress)
+        - Docs
+        - Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you expected, and what you got instead.
+      placeholder: |
+        I called match() with capabilities=["web research"] and expected ranked
+        results. I got an empty list, and last_error was empty too.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: >
+        The smallest code, curl command, or tool call that shows it. Redact keys.
+      render: shell
+    validations:
+      required: true
+
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: >
+        Output of `aidress --version`, or `pip show aidress-sdk aidress-mcp
+        langchain-aidress`. Include your Python version.
+      placeholder: "aidress 0.5.0, aidress-mcp 0.5.0, Python 3.12"
+    validations:
+      required: true
+
+  - type: input
+    id: agent-id
+    attributes:
+      label: agent_id involved (if any)
+      description: >
+        Both sides if a call was involved. Agents change over time, so this is
+        often the difference between us reproducing it and not.
+      placeholder: "caller: my_agent_01, target: agent_exa_ai"
+
+  - type: input
+    id: endpoint
+    attributes:
+      label: Which server?
+      description: The hosted API, or a local instance?
+      placeholder: "https://api.aidress.ai"
+      value: "https://api.aidress.ai"
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Error output, logs, or what you already ruled out.

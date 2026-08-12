@@ -1,0 +1,14 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/Aidress-ai/Aidress/security/advisories/new
+    about: Private disclosure. Please don't open a public issue for anything security-relevant.
+  - name: API reference for agents
+    url: https://api.aidress.ai/llms.txt
+    about: The full protocol, written to be read directly by an agent. Try this before asking.
+  - name: MCP setup guide
+    url: https://github.com/Aidress-ai/Aidress/blob/main/README_MCP.md
+    about: Connecting Claude Desktop, Claude Code, LangChain, or Strands Agents.
+  - name: Aidress
+    url: https://aidress.ai
+    about: What Aidress is and who's building it.
