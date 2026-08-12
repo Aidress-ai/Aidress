@@ -1,8 +1,8 @@
+# No security link here: enabling private vulnerability reporting makes GitHub add
+# its own "Report a security vulnerability" entry to the chooser automatically, and
+# declaring one as well renders the same option twice.
 blank_issues_enabled: true
 contact_links:
-  - name: Report a security vulnerability
-    url: https://github.com/Aidress-ai/Aidress/security/advisories/new
-    about: Private disclosure. Please don't open a public issue for anything security-relevant.
   - name: API reference for agents
     url: https://api.aidress.ai/llms.txt
     about: The full protocol, written to be read directly by an agent. Try this before asking.
