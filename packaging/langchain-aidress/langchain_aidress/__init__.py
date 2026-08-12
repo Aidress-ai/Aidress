@@ -12,6 +12,7 @@ from langchain_aidress.toolkit import AidressToolkit
 from langchain_aidress.tools import (
     AidressCallAgentTool,
     AidressClaimBearerKeyTool,
+    AidressGenerateKeypairTool,
     AidressGetAgentTool,
     AidressImportAgentTool,
     AidressListRegistryTool,
@@ -32,6 +33,7 @@ del metadata
 __all__ = [
     "AidressCallAgentTool",
     "AidressClaimBearerKeyTool",
+    "AidressGenerateKeypairTool",
     "AidressGetAgentTool",
     "AidressImportAgentTool",
     "AidressListRegistryTool",

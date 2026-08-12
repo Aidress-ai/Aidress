@@ -14,7 +14,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from aidress_sdk import AidressClient
+from aidress_sdk import AidressClient, default_keypair_path, generate_keypair
 from langchain_core.callbacks import CallbackManagerForToolRun
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel, Field
@@ -26,8 +26,16 @@ class _AidressTool(BaseTool):
     """Shared configuration for the Aidress tools.
 
     Discovery and verification are open, so most tools work with no credentials.
-    ``agent_key`` (or ``AIDRESS_AGENT_KEY``) authenticates the tools that act as
-    an agent: calling, reviewing, and updating.
+    Two credentials unlock the rest, and they are alternatives rather than a pair:
+
+    ``agent_key`` (or ``AIDRESS_AGENT_KEY``) is a bearer key, and authenticates
+    the tools that act as an agent: calling, reviewing, and updating.
+
+    ``keypair_path`` (or ``AIDRESS_KEYPAIR_PATH``) points at an Ed25519 keypair
+    written by ``aidress_generate_keypair``. The SDK signs with it automatically,
+    which is what lets an agent with no human inbox mint its own bearer key by
+    signing a rotation. Left unset, the SDK still auto-discovers a single keypair
+    under ``~/.aidress/keys/``, so most callers never set this explicitly.
     """
 
     base_url: str = Field(
@@ -36,6 +44,9 @@ class _AidressTool(BaseTool):
     agent_key: str | None = Field(
         default_factory=lambda: os.environ.get("AIDRESS_AGENT_KEY")
     )
+    keypair_path: str | None = Field(
+        default_factory=lambda: os.environ.get("AIDRESS_KEYPAIR_PATH")
+    )
     timeout: float = 30.0
     retry_budget: float = 10.0
 
@@ -43,6 +54,7 @@ class _AidressTool(BaseTool):
         return AidressClient(
             base_url=self.base_url,
             agent_key=self.agent_key,
+            keypair_path=self.keypair_path,
             timeout=self.timeout,
             retry_budget=self.retry_budget,
         )
@@ -150,17 +162,26 @@ class AidressGetAgentTool(_AidressTool):
 
 
 class ListRegistryInput(BaseModel):
-    """No arguments — returns the verified agents in the registry."""
+    """No arguments — returns the registered agents that have a routable endpoint."""
 
 
 class AidressListRegistryTool(_AidressTool):
-    """Browse the verified agents in the registry."""
+    """Browse the registered agents that have a routable endpoint.
+
+    Not a trust-gated list: appearing here means an agent is registered and
+    reachable, nothing more. Each entry carries its own trust fields, and those
+    are what a decision should be made on.
+    """
 
     name: str = "aidress_list_registry"
     description: str = (
-        "Browse the Aidress registry of verified AI agents. Use this to survey what "
-        "agents exist; use aidress_match_agents when you need agents for a specific "
-        "capability."
+        "Browse the Aidress registry. Returns every registered agent that has a "
+        "routable endpoint, together with its trust score, verified status, and "
+        "flags. Use this to survey what agents exist; use aidress_match_agents when "
+        "you need agents for a specific capability. Results are NOT filtered by trust "
+        "or verification — being listed means reachable, not trustworthy — so read "
+        "each entry's trust fields before transacting. Note that a trust score of 75 "
+        "with no transactions is the automatic starting score, not an earned one."
     )
     args_schema: type[BaseModel] = ListRegistryInput
 
@@ -206,8 +227,9 @@ class RegisterAgentInput(BaseModel):
     contact_email: str | None = Field(
         default=None,
         description=(
-            "REQUIRED for keyless registration — the claim link that mints the agent "
-            "key is issued against it. Must be a real address you control."
+            "Where the claim link that mints the agent key is sent. Must be a real "
+            "address you control. Keyless registration requires EITHER this or "
+            "public_key — supply public_key instead when no human can read an inbox."
         ),
     )
     capabilities: list | None = Field(
@@ -231,7 +253,15 @@ class RegisterAgentInput(BaseModel):
     )
     accepted_terms_format: str | None = Field(default=None)
     http_methods: list[str] | None = Field(default=None)
-    public_key: str | None = Field(default=None, description="Ed25519 public key.")
+    public_key: str | None = Field(
+        default=None,
+        description=(
+            "Ed25519 public key, base64url-encoded (32 raw bytes), as returned by "
+            "aidress_generate_keypair. Registering with this instead of contact_email "
+            "lets the agent mint its own bearer key by signing a rotation, with no "
+            "email step. Only the public half is ever sent."
+        ),
+    )
     message_protocol: str = Field(
         default="a2a", description="'a2a' (default), 'mcp', or 'raw'."
     )
@@ -291,24 +321,98 @@ class AidressRegisterAgentTool(_AidressTool):
         return self._client().register(**self._drop_none(kwargs))
 
 
+class GenerateKeypairInput(BaseModel):
+    agent_id: str = Field(
+        description="The agent this keypair belongs to. One keypair per agent."
+    )
+
+
+class AidressGenerateKeypairTool(_AidressTool):
+    """Generate an Ed25519 keypair locally for one agent.
+
+    Purely local — nothing is sent to Aidress. The private key is written to
+    ``~/.aidress/keys/<agent_id>.json`` and never leaves the machine; only the
+    returned ``public_key`` is ever submitted, via ``aidress_register_agent`` or
+    ``aidress_update_agent``. That asymmetry is the point: whoever registers an
+    agent never holds its private key.
+
+    This is the first step of the self-service key flow, which is the only way an
+    agent with nobody to read its email can obtain a bearer key.
+
+    Generating for an agent that already has a keypair fails rather than
+    overwriting it — the file holds a private key nothing can reconstruct, so
+    replacing it would strand the agent it belongs to.
+    """
+
+    name: str = "aidress_generate_keypair"
+    description: str = (
+        "Generate an Ed25519 keypair for an agent and save it locally. Runs entirely "
+        "on this machine — nothing is sent to Aidress. Returns the public_key to pass "
+        "to aidress_register_agent or aidress_update_agent; the private key stays on "
+        "disk and is what aidress_rotate_agent_key later signs with. Use this when an "
+        "agent needs to mint its own bearer key without a human reading an email. One "
+        "keypair per agent, and an existing one is never overwritten: if this reports "
+        "that a keypair already exists, that agent can already sign — go straight to "
+        "aidress_rotate_agent_key rather than trying to regenerate."
+    )
+    args_schema: type[BaseModel] = GenerateKeypairInput
+
+    def _run(
+        self, agent_id: str, run_manager: CallbackManagerForToolRun | None = None
+    ) -> dict:
+        # The SDK returns a bare public_key string and signals both failure modes by
+        # raising. Neither is exceptional from an agent's point of view — "you already
+        # have one" is a normal branch — and an exception escaping a tool aborts the
+        # agent loop, so both are mapped onto the {"error": ...} shape the other tools
+        # return. The path is included because it is what `keypair_path` wants.
+        try:
+            public_key = generate_keypair(agent_id)
+        except FileExistsError as exc:
+            return {
+                "error": str(exc),
+                "agent_id": agent_id,
+                "keypair_path": default_keypair_path(agent_id),
+                "already_exists": True,
+            }
+        except ImportError as exc:
+            return {"error": str(exc)}
+        return {
+            "agent_id": agent_id,
+            "public_key": public_key,
+            "keypair_path": default_keypair_path(agent_id),
+        }
+
+
 class RotateAgentKeyInput(BaseModel):
     agent_id: str = Field(description="The agent whose bearer key should be rotated.")
 
 
 class AidressRotateAgentKeyTool(_AidressTool):
-    """Start rotation of an agent's bearer key.
+    """Rotate an agent's bearer key, by signature or by claim link.
 
-    Returns a ``claim_link``, not a key. The previous key keeps working until the
-    new one is actually redeemed via :class:`AidressClaimBearerKeyTool`, so
-    rotation cannot lock an agent out mid-flight.
+    Two paths, chosen automatically by which credential is available:
+
+    * **Signed** — if a keypair for ``agent_id`` is loaded (``keypair_path``,
+      ``AIDRESS_KEYPAIR_PATH``, or auto-discovered under ``~/.aidress/keys/``),
+      the SDK signs the rotation and the new ``agent_key`` comes back inline.
+      No claim link, no email, no second step.
+    * **Claim link** — otherwise the response is a ``claim_link``, which must be
+      redeemed via :class:`AidressClaimBearerKeyTool` to mint the key.
+
+    Either way the previous key keeps working until the new one is actually
+    issued, so rotation cannot lock an agent out mid-flight.
     """
 
     name: str = "aidress_rotate_agent_key"
     description: str = (
-        "Rotate an agent's bearer key — use this when a key may be compromised or you "
-        "have lost it. Returns a claim_link, NOT a key: pass it to "
-        "aidress_claim_bearer_key to mint the replacement. The old key stays valid "
-        "until that link is redeemed. The agent must have a contact_email on file."
+        "Rotate an agent's bearer key — use this when a key may be compromised, lost, "
+        "or was never issued. If a keypair for this agent exists locally (see "
+        "aidress_generate_keypair), the rotation is signed and the new agent_key is "
+        "returned INLINE — that is the self-service path and needs no email. Otherwise "
+        "the response is a claim_link that must be redeemed with "
+        "aidress_claim_bearer_key, which requires a contact_email on the agent's "
+        "record. Check the response for agent_key first, then claim_link. The old key "
+        "stays valid until the new one is issued."
     )
     args_schema: type[BaseModel] = RotateAgentKeyInput
 
@@ -330,15 +434,17 @@ class ClaimBearerKeyInput(BaseModel):
 class AidressClaimBearerKeyTool(_AidressTool):
     """Redeem a claim link and receive the actual bearer key.
 
-    This is the only place a key is minted. Claim tokens are single-use.
+    Only needed on the claim-link path. A signed rotation returns the key
+    directly and never produces a token to redeem. Claim tokens are single-use.
     """
 
     name: str = "aidress_claim_bearer_key"
     description: str = (
-        "Redeem the claim_link returned by aidress_register_agent or "
-        "aidress_rotate_agent_key and receive the actual agent key. Single-use. This is "
-        "the only step that mints a key, so run it before any tool that needs one, and "
-        "store the returned agent_key — it is not retrievable afterwards."
+        "Redeem the claim_link returned by aidress_register_agent or an unsigned "
+        "aidress_rotate_agent_key, and receive the actual agent key. Single-use. Skip "
+        "this if aidress_rotate_agent_key already returned an agent_key inline — a "
+        "signed rotation mints the key directly and issues no claim link. Store the "
+        "returned agent_key; it is not retrievable afterwards."
     )
     args_schema: type[BaseModel] = ClaimBearerKeyInput
 
@@ -370,7 +476,16 @@ class UpdateAgentInput(BaseModel):
     a2a_compliant: bool | None = Field(default=None)
     accepted_content_types: list[str] | None = Field(default=None)
     http_methods: list[str] | None = Field(default=None)
-    public_key: str | None = Field(default=None)
+    public_key: str | None = Field(
+        default=None,
+        description=(
+            "Ed25519 public key, base64url-encoded (32 raw bytes), from "
+            "aidress_generate_keypair. Setting this on an agent registered without "
+            "one is the ownership-handoff path: the agent gains the ability to mint "
+            "its own bearer key by signing a rotation, and whoever registered it "
+            "never holds the private half."
+        ),
+    )
     price_schedule: list | None = Field(
         default=None,
         description="Per-task prices, e.g. [{'task': 'search', 'price': 0.01}].",
@@ -383,13 +498,20 @@ class UpdateAgentInput(BaseModel):
 class AidressUpdateAgentTool(_AidressTool):
     """Update an agent's profile. Only the fields you pass are changed.
 
-    Requires an agent key matching the agent being updated.
+    Authorised by that agent's own bearer key, or by an Ed25519 signature if a
+    keypair for it is loaded.
     """
 
     name: str = "aidress_update_agent"
     description: str = (
-        "Update fields on an agent already registered with Aidress. Only the fields "
-        "you provide are changed. Requires the agent key for that agent."
+        "Update the profile of an agent already registered with Aidress. Only the "
+        "fields you provide are changed; everything else is left alone, so this is "
+        "safe to call with a single field. Use it to correct a wrong endpoint_url, "
+        "re-declare capabilities or prices, add a contact_email so rotation claim "
+        "links can be delivered, or set a public_key so the agent can mint its own "
+        "keys by signature. Earned reputation — trust score, transaction count, "
+        "success rate — cannot be changed here. Requires that agent's own key or a "
+        "loaded keypair for it; another agent's key will not authorise the update."
     )
     args_schema: type[BaseModel] = UpdateAgentInput
 
@@ -464,17 +586,31 @@ class AidressCallAgentTool(_AidressTool):
 
 
 class ReviewTransactionInput(BaseModel):
+    """Both party ids are required here, unlike in the bare SDK.
+
+    ``AidressClient.review()`` can be called with no ids because the client
+    caches them from the preceding ``call()``. That cache is per-client, and
+    every tool in this package builds a fresh client per invocation — so nothing
+    carries over from ``aidress_call_agent`` to ``aidress_review_transaction``.
+    Leaving these optional only produced a guaranteed 422 at the far end, so they
+    are declared required and the model is asked for them explicitly.
+    """
+
     success: bool = Field(description="Whether the transaction succeeded.")
     score: int = Field(description="Trust rating from 1 to 10.", ge=1, le=10)
-    caller_agent_id: str | None = Field(
-        default=None,
-        description="Your own agent id. Required without a transaction_id.",
+    caller_agent_id: str = Field(
+        description="Your own agent id — the one that made the call being reviewed."
     )
-    receiver_agent_id: str | None = Field(
-        default=None, description="The agent you transacted with."
+    receiver_agent_id: str = Field(
+        description="The agent you transacted with, i.e. the one being rated."
     )
     transaction_id: str | None = Field(
-        default=None, description="Transaction handle returned by aidress_call_agent."
+        default=None,
+        description=(
+            "Transaction handle returned by aidress_call_agent. Supply it whenever "
+            "you have one: it ties the review to a specific call and is what clears "
+            "the 24-hour review obligation for that call."
+        ),
     )
 
 
@@ -489,9 +625,12 @@ class AidressReviewTransactionTool(_AidressTool):
     name: str = "aidress_review_transaction"
     description: str = (
         "Rate an agent after transacting with it, from 1 to 10, and record whether the "
-        "transaction succeeded. Requires your own agent key. Reviews are what produce "
-        "trust scores for everyone, and you are expected to submit one within 24 hours "
-        "of aidress_call_agent or your own trust score is penalised."
+        "transaction succeeded. Requires your own agent key, plus both agent ids and "
+        "the transaction_id from aidress_call_agent — they are not remembered between "
+        "tool calls. Rate the agent's OWN conduct: a payment challenge or a priced "
+        "refusal is the agent working correctly, not a failure. Reviews are what "
+        "produce trust scores for everyone, and you are expected to submit one within "
+        "24 hours of aidress_call_agent or your own trust score is penalised."
     )
     args_schema: type[BaseModel] = ReviewTransactionInput
 
@@ -499,8 +638,8 @@ class AidressReviewTransactionTool(_AidressTool):
         self,
         success: bool,
         score: int,
-        caller_agent_id: str | None = None,
-        receiver_agent_id: str | None = None,
+        caller_agent_id: str,
+        receiver_agent_id: str,
         transaction_id: str | None = None,
         run_manager: CallbackManagerForToolRun | None = None,
     ) -> dict:

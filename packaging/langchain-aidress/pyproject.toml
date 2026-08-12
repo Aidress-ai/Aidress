@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "langchain-aidress"
-version = "0.2.0"
+version = "0.3.0"
 description = "Aidress agent trust and discovery tools for LangChain"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -23,9 +23,11 @@ classifiers = [
 ]
 dependencies = [
     "langchain-core>=0.3,<2",
-    # 0.3.0 is the floor: rotate()/claim()/update() and match()'s org_name +
-    # message_protocol filters, all surfaced as tools here, do not exist before it.
-    "aidress-sdk>=0.3.0,<1.0.0",
+    # 0.5.0 is the floor: aidress_generate_keypair imports default_keypair_path and
+    # generate_keypair, and AidressClient takes keypair_path — none of which exist
+    # before it. Installing against 0.4.x fails at import, not at call time, so this
+    # floor is what keeps the package importable at all.
+    "aidress-sdk>=0.5.0,<1.0.0",
 ]
 
 [project.urls]
@@ -45,6 +47,19 @@ lint = ["ruff>=0.6"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["langchain_aidress"]
+
+# Allow-list rather than exclude-list. The sdist otherwise sweeps up whatever
+# happens to be sitting in this directory, and a local virtualenv is enough to
+# abort the build outright ("is a link to an absolute path") — which fails the
+# release mid-flight, after the version strings have already been rewritten.
+[tool.hatch.build.targets.sdist]
+include = [
+    "langchain_aidress",
+    "tests",
+    "README.md",
+    "LICENSE",
+    "pyproject.toml",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

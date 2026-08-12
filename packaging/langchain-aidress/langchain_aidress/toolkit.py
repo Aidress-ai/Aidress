@@ -12,6 +12,7 @@ from langchain_aidress.tools import (
     DEFAULT_BASE_URL,
     AidressCallAgentTool,
     AidressClaimBearerKeyTool,
+    AidressGenerateKeypairTool,
     AidressGetAgentTool,
     AidressImportAgentTool,
     AidressListRegistryTool,
@@ -39,10 +40,18 @@ class AidressToolkit(BaseToolkit):
 
         tools = AidressToolkit(agent_key="aidress-agent-sk-...").get_tools()
 
-    An agent key comes from redeeming the ``claim_link`` that registration or
-    rotation returns; both of those steps are in the keyless set, so an agent can
-    bootstrap its own credentials with this toolkit alone. Set ``include_all=True``
-    to return every tool regardless of which credentials are configured.
+    An agent key can be bootstrapped with this toolkit alone, by either of two
+    routes — both entirely inside the keyless set:
+
+    * **Signature** — ``aidress_generate_keypair`` → ``aidress_register_agent``
+      with the returned ``public_key`` → ``aidress_rotate_agent_key``, which
+      returns the key inline. No email, no human. This is the route for an agent
+      with nobody to read an inbox.
+    * **Claim link** — ``aidress_register_agent`` with a ``contact_email`` →
+      ``aidress_claim_bearer_key`` with the link that comes back.
+
+    Set ``include_all=True`` to return every tool regardless of which credentials
+    are configured.
     """
 
     base_url: str = Field(
@@ -50,6 +59,9 @@ class AidressToolkit(BaseToolkit):
     )
     agent_key: str | None = Field(
         default_factory=lambda: os.environ.get("AIDRESS_AGENT_KEY")
+    )
+    keypair_path: str | None = Field(
+        default_factory=lambda: os.environ.get("AIDRESS_KEYPAIR_PATH")
     )
     timeout: float = 30.0
     retry_budget: float = 10.0
@@ -59,6 +71,7 @@ class AidressToolkit(BaseToolkit):
         return {
             "base_url": self.base_url,
             "agent_key": self.agent_key,
+            "keypair_path": self.keypair_path,
             "timeout": self.timeout,
             "retry_budget": self.retry_budget,
         }
@@ -68,8 +81,10 @@ class AidressToolkit(BaseToolkit):
         config = self._config()
 
         # Discovery, verification, registration, and the key lifecycle need no
-        # credentials — rotation is authorised by the contact_email already on the
-        # agent's record, and claiming is authorised by possession of the token.
+        # bearer key. Keypair generation is purely local; rotation is authorised by
+        # an Ed25519 signature or by the contact_email already on the agent's record,
+        # and claiming is authorised by possession of the token. So this whole set is
+        # reachable by an agent that has no credentials yet.
         tools: list[BaseTool] = [
             AidressVerifyAgentTool(**config),
             AidressMatchAgentsTool(**config),
@@ -77,6 +92,7 @@ class AidressToolkit(BaseToolkit):
             AidressListRegistryTool(**config),
             AidressImportAgentTool(**config),
             AidressRegisterAgentTool(**config),
+            AidressGenerateKeypairTool(**config),
             AidressRotateAgentKeyTool(**config),
             AidressClaimBearerKeyTool(**config),
         ]

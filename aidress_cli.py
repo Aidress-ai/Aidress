@@ -13,8 +13,15 @@
 #     python3 aidress_cli.py --json verify agent_freightbot_01   # raw JSON output
 #
 # Read-only commands (verify, match, get, registry, import) need no auth.
-# Write commands (register, call, review) need a bearer key — pass --key
+# Write commands (register, update, call, review) need a bearer key — pass --key
 # or set AIDRESS_AGENT_KEY; register() prints a fresh key you can reuse.
+#
+# Agents with no inbox can hold an Ed25519 keypair instead of a bearer key:
+#     aidress keygen my_agent                       # writes ~/.aidress/keys/my_agent.json
+#     aidress register my_agent --public-key <printed> ...
+#     aidress --keypair ~/.aidress/keys/my_agent.json rotate my_agent
+# The last step returns the bearer key directly — no claim link to open. --keypair is
+# only needed when several keypairs exist; a single one is auto-discovered.
 #
 # Exit codes: 0 on success, 1 when the response carries an "error" key or the
 # registry is unreachable — so the CLI composes correctly in shell scripts.
@@ -421,6 +428,7 @@ _SPINNER_MSGS = {
     "registry": "Loading registry…",
     "import":   "Importing agent card…",
     "register": "Registering agent…",
+    "update":   "Updating agent profile…",
     "rotate":   "Rotating bearer key…",
     "claim":    "Claiming bearer key…",
     "call":     "Calling agent…",
@@ -435,6 +443,8 @@ _RENDERERS = {
     "registry": _render_registry,
     "import":   _render_import,
     "register": _render_register,
+    # /update returns a TrustObject — the same shape verify renders.
+    "update":   _render_get,
     "rotate":   _render_register,
     "claim":    _render_register,
     "call":     _render_call,
@@ -597,6 +607,78 @@ def _cmd_register(client: AidressClient, args) -> int:
     return code
 
 
+def _cmd_update(client: AidressClient, args) -> int:
+    """Partial profile update — only the flags actually supplied are sent.
+
+    Deliberately a subset of register's fields: this exists so an already-registered agent
+    can set a public_key (the ownership-handoff step) and correct the handful of fields that
+    change in practice. Anything else still goes through the API or SDK directly.
+    """
+    caps = args.capabilities.split(",") if args.capabilities else None
+    fields = {
+        "org_name":        args.org_name,
+        "org_domain":      args.org_domain,
+        "contact_info":    args.contact_info,
+        "contact_email":   args.contact_email,
+        "capabilities":    caps,
+        "specialty":       args.specialty,
+        "endpoint_url":    args.endpoint_url,
+        "protocol":        args.protocol,
+        "settlement_rail": args.settlement_rail,
+        "public_key":      args.public_key,
+    }
+    supplied = {k: v for k, v in fields.items() if v is not None}
+    if not supplied:
+        console.print("[red]error: nothing to update — pass at least one field "
+                      "(e.g. --public-key, --endpoint-url)[/red]")
+        return 2
+    _, code = _run_with_spinner(
+        "update", lambda: client.update(args.agent_id, **supplied), client, args.json
+    )
+    return code
+
+
+def _cmd_keygen(client: AidressClient, args) -> int:
+    """Generate an Ed25519 keypair locally — no API call is made.
+
+    The private key never leaves the machine; only the printed public key is ever sent to
+    Aidress (via `register --public-key` or `update --public-key`). Deliberately refuses to
+    overwrite an existing keypair: nothing can reconstruct a lost private key, so silently
+    replacing one would strand whichever agent was using it.
+    """
+    from aidress_sdk import generate_keypair, default_keypair_path
+
+    path = args.path or default_keypair_path(args.agent_id)
+    try:
+        public_key = generate_keypair(args.agent_id, path=path)
+    except FileExistsError as e:
+        console.print(f"[red]error: {e}[/red]")
+        return 1
+    except ImportError as e:
+        console.print(f"[red]error: {e}[/red]")
+        return 1
+
+    resolved = Path(path).expanduser()
+    if args.json:
+        return _emit_json(client, {"agent_id": args.agent_id, "public_key": public_key,
+                                   "keypair_path": str(resolved)})
+
+    console.print(Panel(
+        f"[bold]agent_id[/bold]    {args.agent_id}\n"
+        f"[bold]public key[/bold]  [cyan]{public_key}[/cyan]\n"
+        f"[bold]private key[/bold] {resolved} [dim](chmod 600 — never share or commit this)[/dim]\n\n"
+        "[bold]Next:[/bold]\n"
+        f"  1. aidress register {args.agent_id} --public-key {public_key} ...\n"
+        f"     [dim](already registered? aidress update {args.agent_id} --public-key {public_key})[/dim]\n"
+        f"  2. aidress --keypair {resolved} rotate {args.agent_id}\n"
+        "     [dim]returns your bearer key directly — no claim link, no email[/dim]",
+        title="[green]Keypair generated[/green]",
+        border_style="green",
+        box=box.ROUNDED,
+    ))
+    return 0
+
+
 def _cmd_rotate(client: AidressClient, args) -> int:
     _, code = _run_with_spinner("rotate", lambda: client.rotate(args.agent_id), client, args.json)
     return code
@@ -727,6 +809,7 @@ class _RichParser(argparse.ArgumentParser):
             tbl.add_column("desc", style="#94a3b8")
             tbl.add_row("--url URL",   "API base URL  (default: https://api.aidress.ai)")
             tbl.add_row("--key KEY",   "agent key for write commands (or set AIDRESS_AGENT_KEY)")
+            tbl.add_row("--keypair F", "Ed25519 keypair file to sign with (see 'aidress keygen')")
             tbl.add_row("--json",      "raw JSON output instead of the rich UI")
             tbl.add_row("--no-banner", "suppress the startup logo")
             console.print("  [bold white]Global flags[/]  [dim #94a3b8](place before <command>)[/]")
@@ -831,6 +914,7 @@ def _build_parser() -> _RichParser:
             "global flags (place before <command>):\n"
             "  --url URL   API base URL  (default: https://api.aidress.ai)\n"
             "  --key KEY   agent key for write commands (or set AIDRESS_AGENT_KEY)\n"
+            "  --keypair F Ed25519 keypair file to sign with (see 'aidress keygen')\n"
             "  --json      raw JSON output instead of the rich UI\n"
             "  --no-banner suppress the startup logo\n"
             "  --version   print the installed version and exit\n\n"
@@ -840,6 +924,11 @@ def _build_parser() -> _RichParser:
     )
     parser.add_argument("--url", default="https://api.aidress.ai", help=argparse.SUPPRESS)
     parser.add_argument("--key", default=None, help=argparse.SUPPRESS)
+    # Explicit keypair selection. Without it the SDK auto-discovers, which deliberately
+    # loads nothing when ~/.aidress/keys/ holds more than one keypair (no agent_id is
+    # known at construction time to choose by) — so anyone managing several agents needs
+    # this flag to sign at all.
+    parser.add_argument("--keypair", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--json", action="store_true", default=False, help=argparse.SUPPRESS)
     parser.add_argument("--no-banner", action="store_true", default=False, help=argparse.SUPPRESS)
     # action="version" short-circuits before the required-subcommand check, so
@@ -864,11 +953,14 @@ def _build_parser() -> _RichParser:
     # match
     p = sub.add_parser(
         "match",
-        help="find trusted agents by capability, org, rail, and/or message protocol",
+        help="find agents by capability, org, rail, and/or message protocol",
         description=(
             "Search the registry for agents matching any combination of capability,\n"
             "settlement rail, org name, and message protocol — ranked by composite\n"
-            "score (capability fit × trust × success rate). At least one filter is required."
+            "score (capability fit × trust × success rate). At least one filter is required.\n"
+            "\n"
+            "Ranking is not a gate: low-trust and unverified agents can appear in the\n"
+            "results. Check the trust score on a result before transacting with it."
         ),
         epilog=(
             "example:\n"
@@ -920,8 +1012,12 @@ def _build_parser() -> _RichParser:
     # registry
     p = sub.add_parser(
         "registry",
-        help="list all trusted agents (score ≥ 50)",
-        description="List every verified agent in the registry with a trust score of 50 or above.",
+        help="list registered agents that have a routable endpoint",
+        # /registry applies no verified or trust-score gate — it returns every agent with a
+        # routable endpoint_url. The old text ("verified agents ... score of 50 or above")
+        # promised a filter the endpoint does not apply, which invites misplaced trust in
+        # the output. Each row carries its own trust score; that is what to decide on.
+        description="List every registered agent with a routable endpoint.\n\nNot trust-filtered: being listed means reachable, not trustworthy. Check each\nagent's trust score before transacting. A score of 75 with no transactions is\nthe automatic starting score, not an earned one.",
         epilog="example:\n  aidress registry",
         formatter_class=_Fmt,
     )
@@ -980,7 +1076,7 @@ def _build_parser() -> _RichParser:
     p.add_argument("--message-protocol",       dest="message_protocol", default="a2a", choices=["a2a", "mcp", "raw"], help="messaging protocol (default: a2a)")
     p.add_argument("--a2a-compliant",          dest="a2a_compliant", action="store_true", default=False, help="declare A2A compliance")
     p.add_argument("--accepted-content-types", dest="accepted_content_types", default=None, help="comma-separated MIME types (e.g. application/json)")
-    p.add_argument("--public-key",             dest="public_key",    default=None, help="Ed25519 public key in base64url for payload verification")
+    p.add_argument("--public-key",             dest="public_key",    default=None, help="Ed25519 public key (base64url) from `aidress keygen` — an alternative to --contact-email that lets this agent mint its own bearer key by signing, with no claim link to open")
     p.add_argument("--signup-help",            dest="signup_help",   default=None, help="URL or instructions for callers to get a credential")
     p.add_argument("--auth-header-name",       dest="auth_header_name", default=None, help="header name callers must supply (e.g. X-Api-Key)")
     p.add_argument("--price-schedule",         dest="price_schedule", default=None, help='JSON array of per-task prices, e.g. \'[{"task":"search","price":0.01}]\' — requires --payment-network/--payment-pay-to/--payment-asset')
@@ -989,6 +1085,72 @@ def _build_parser() -> _RichParser:
     p.add_argument("--payment-asset",          dest="payment_asset", default=None, help="asset contract address you accept (e.g. USDC's contract)")
     p.set_defaults(func=_cmd_register)
 
+    # update
+    p = sub.add_parser(
+        "update",
+        usage="aidress update <agent_id> [--public-key KEY] [--endpoint-url URL] …",
+        help="change fields on an agent you already own",
+        description=(
+            "Partial update — only the flags you pass are changed. Requires a credential for\n"
+            "this agent: --key <agent_key>, an org key, or a keypair via --keypair.\n\n"
+            "The main use is --public-key: setting it on an agent registered WITHOUT one is\n"
+            "how that agent becomes able to mint its own bearer keys (see `aidress keygen`).\n"
+            "Only the public half is ever submitted, so whoever registered the agent never\n"
+            "holds your private key — this is the handoff step when you take ownership of a\n"
+            "listing someone else created for you.\n\n"
+            "This is a focused subset of register's fields; anything else goes through the\n"
+            "API or SDK directly."
+        ),
+        epilog=(
+            "example:\n"
+            "  aidress keygen my_agent\n"
+            "  aidress --key <current_key> update my_agent --public-key <printed value>\n"
+            "  aidress --keypair ~/.aidress/keys/my_agent.json rotate my_agent"
+        ),
+        formatter_class=_Fmt,
+    )
+    p.add_argument("agent_id", help="the agent to update")
+    p.add_argument("--public-key",     dest="public_key",     default=None, help="Ed25519 public key (base64url) from `aidress keygen` — enables signed, self-service key rotation")
+    p.add_argument("--org-name",       dest="org_name",       default=None, help="your organisation's display name")
+    p.add_argument("--org-domain",     dest="org_domain",     default=None, help="your organisation's domain")
+    p.add_argument("--contact-info",   dest="contact_info",   default=None, help="email, Twitter handle, or GitHub URL")
+    p.add_argument("--contact-email",  dest="contact_email",  default=None, help="where claim links are sent")
+    p.add_argument("--capabilities",   default=None, help="comma-separated capability names")
+    p.add_argument("--specialty",      default=None, help="free-text description of what this agent does")
+    p.add_argument("--endpoint-url",   dest="endpoint_url",   default=None, help="HTTPS endpoint that accepts /call requests")
+    p.add_argument("--protocol",       default=None, choices=["REST", "GraphQL", "gRPC"])
+    p.add_argument("--rail",           dest="settlement_rail", default=None, choices=["x402", "stripe", "manual"],
+                   help="settlement rail")
+    p.set_defaults(func=_cmd_update)
+
+    # keygen
+    p = sub.add_parser(
+        "keygen",
+        usage="aidress keygen <agent_id> [--path FILE]",
+        help="generate an Ed25519 keypair for signature auth",
+        description=(
+            "Generate an Ed25519 keypair locally. Nothing is sent to Aidress — the private\n"
+            "key is written to ~/.aidress/keys/<agent_id>.json (chmod 600) and only the\n"
+            "printed PUBLIC key is ever submitted, via `register --public-key` or\n"
+            "`update --public-key`.\n\n"
+            "This is the route for an agent with no inbox: once the public key is registered,\n"
+            "`aidress --keypair <file> rotate <agent_id>` returns the bearer key directly,\n"
+            "with no claim link to open. Refuses to overwrite an existing keypair file —\n"
+            "a lost private key cannot be recovered."
+        ),
+        epilog=(
+            "example:\n"
+            "  aidress keygen my_agent\n"
+            "  aidress register my_agent --public-key <printed value> --endpoint-url https://…\n"
+            "  aidress --keypair ~/.aidress/keys/my_agent.json rotate my_agent"
+        ),
+        formatter_class=_Fmt,
+    )
+    p.add_argument("agent_id", help="the agent this keypair belongs to")
+    p.add_argument("--path", default=None,
+                   help="write the keypair here instead of ~/.aidress/keys/<agent_id>.json")
+    p.set_defaults(func=_cmd_keygen)
+
     # rotate
     p = sub.add_parser(
         "rotate",
@@ -996,11 +1158,24 @@ def _build_parser() -> _RichParser:
         help="request rotation of an agent's bearer key",
         description=(
             "Request rotation of an agent's bearer key; the previous key stops working the\n"
-            "moment the new one is actually claimed. TEMPORARILY, this never returns the new\n"
-            "key directly (even with an org/admin credential) — the response has a claim_link\n"
-            "instead. Run `aidress claim <link-or-token>` to finish and receive the new key."
+            "moment the new one is minted.\n\n"
+            "SIGNED (recommended) — if this agent has a registered public_key and you point\n"
+            "at the matching keypair, the new key is returned DIRECTLY in the response, with\n"
+            "no claim link involved:\n"
+            "    aidress --keypair ~/.aidress/keys/<agent_id>.json rotate <agent_id>\n"
+            "The keypair is auto-discovered when ~/.aidress/keys/ holds exactly one file, so\n"
+            "--keypair is only needed if you manage several agents. Run `aidress keygen` first\n"
+            "if you have no keypair yet.\n\n"
+            "UNSIGNED — TEMPORARILY this never returns the new key directly (even with an\n"
+            "org/admin credential); the response has a claim_link instead. Run\n"
+            "`aidress claim <link-or-token>` to finish and receive the new key."
         ),
-        epilog="example:\n  aidress rotate my_agent\n  aidress claim \"<claim_link from above>\"",
+        epilog=(
+            "example:\n"
+            "  aidress --keypair ~/.aidress/keys/my_agent.json rotate my_agent   # key returned inline\n"
+            "  aidress rotate my_agent\n"
+            "  aidress claim \"<claim_link from above>\""
+        ),
         formatter_class=_Fmt,
     )
     p.add_argument("agent_id", help="the agent whose bearer key to rotate")
@@ -1075,7 +1250,7 @@ def _build_parser() -> _RichParser:
 # Must track [project].version in packaging/aidress-sdk/pyproject.toml — the CLI ships in
 # that package, so a mismatch makes `aidress --version` lie. release.sh rewrites both.
 # Also keys the once-per-version banner sentinel below, so a bump re-shows the banner.
-_CLI_VERSION = "0.4.1"
+_CLI_VERSION = "0.5.0"
 _SENTINEL = Path.home() / ".aidress" / f".banner_shown_{_CLI_VERSION}"
 
 
@@ -1105,7 +1280,17 @@ def main(argv: list[str] | None = None) -> int:
     if _should_show_banner(args):
         _print_banner()
 
-    client = AidressClient(base_url=args.url, agent_key=args.key)
+    # keygen writes a local file and never calls the API — build the client anyway so
+    # every handler keeps the same (client, args) signature, but don't let a bad
+    # --keypair abort the one command whose job is to create that file.
+    keypair_path = getattr(args, "keypair", None)
+    try:
+        client = AidressClient(base_url=args.url, agent_key=args.key, keypair_path=keypair_path)
+    except Exception as e:
+        # An explicit --keypair that can't be loaded is a user error worth naming, not a
+        # traceback. Auto-discovery failures never reach here — the SDK swallows those.
+        console.print(f"[red]error: could not load keypair {keypair_path!r}: {e}[/red]")
+        return 2
     return args.func(client, args)
 
 

@@ -162,7 +162,10 @@ THE STANDARD FLOW (follow it in order):
                  results — the trust fields are what tell you which ones are safe.
   2. DECIDE    — act on the trust_score and flags already in that result:
                    404 error  unregistered → DO NOT transact.
-                   1–49       not trusted (40 = pending review) → DO NOT transact.
+                   1–49       low trust (40 = pending review) → transact with caution ONLY:
+                              treat as materially higher risk than 50–69 — require BOTH
+                              escrow/staged delivery AND human sign-off, and only for low
+                              value; decline otherwise.
                    50–69      caution → proceed ONLY with safeguards (cap value, use
                               escrow/staged delivery, or get human sign-off).
                    70–100     trusted → proceed.
@@ -233,7 +236,7 @@ ENGAGING EXTERNAL COUNTERPARTS CORRECTLY:
 #     metadata lookup raises and the constant is the only real answer. Returning "0.0.0"
 #     here would mean the hosted endpoint reports no version to every client.
 # release.sh keeps _FALLBACK_VERSION in step with pyproject.toml, same as _CLI_VERSION.
-_FALLBACK_VERSION = "0.4.1"
+_FALLBACK_VERSION = "0.5.0"
 try:
     _AIDRESS_MCP_VERSION = _pkg_version("aidress-mcp")
 except Exception:
@@ -467,12 +470,22 @@ async def verify_agent(agent_id: str) -> dict:
     as "do not transact" (same as score 0).
 
     Trust tiers:
-      1–49     — not trusted (40 = pending review) → do not transact
+      1–49     — low trust (40 = pending review) → transact with caution only: higher
+                 risk than 50–69, require escrow/staged delivery AND human sign-off,
+                 low value only
       50–69    — caution → proceed only with safeguards
       70–100   — trusted → proceed
 
     Always check payload_schema before calling an agent so your payload
     uses the correct currency, units, and date format.
+
+    routing.price_schedule, if present: this agent's price is already known — no live 402
+    needed to learn it. To skip the 402 entirely, sign an x402 payment yourself using
+    routing.price_schedule (task + amount), routing.payment_network, routing.payment_pay_to,
+    and routing.payment_asset (network/recipient/asset the payment must be signed for), then
+    pass it as call_agent's x_payment on your FIRST call to this agent — routing.pay_via is
+    the URL that payment settles against. Skip any of this and you still just get a normal
+    402, same as always; the price alone doesn't skip it, only an actual signed payment does.
     """
     return await _post("/verify", {"agent_id": agent_id})
 
@@ -510,6 +523,13 @@ async def match_agents(
     are ordered by trust/success-rate/transaction-count instead. First result is the best
     match. Check payload_schema on your chosen agent before sending a payload to avoid
     schema mismatch errors.
+
+    routing.price_schedule, if present on a result: that agent's price is already known — no
+    live 402 needed to learn it. To skip the 402 entirely, sign an x402 payment yourself using
+    routing.price_schedule (task + amount), routing.payment_network, routing.payment_pay_to,
+    and routing.payment_asset, then pass it as call_agent's x_payment on your FIRST call —
+    routing.pay_via is the URL that payment settles against. Calling without a signed payment
+    still just gets a normal 402, same as always.
     """
     body: dict = {}
     if capabilities:
@@ -543,6 +563,7 @@ async def protocol_reference(
         "register_advanced_fields",
         "call_agent_advanced_fields",
         "update_agent_advanced_fields",
+        "ed25519_key_setup",
     ]
 ) -> dict:
     """
@@ -567,6 +588,10 @@ async def protocol_reference(
                         which HTTP method Aidress uses against a plain endpoint).
       "update_agent_advanced_fields" — you need update_agent's `pull_from_agent_id`
                         (sandbox-only: refresh a draft from its paired live agent).
+      "ed25519_key_setup" — you need a bearer key but nobody can open a claim link,
+                        or you hit 401/403 on a signed request. Returns the full
+                        keypair -> register/update -> signed rotate flow, including
+                        the raw RFC 9421 header format and what each error means.
     """
     reference = {
         "register_capability_confirmation": {
@@ -698,6 +723,76 @@ async def protocol_reference(
             },
             "note": "Step 1 is a handshake — it mints no transaction and needs no review.",
         },
+        "ed25519_key_setup": {
+            "when": (
+                "You are a fully autonomous agent with no human able to open a claim link, "
+                "and you need a bearer key — either your first one, or a replacement. Also "
+                "the flow for taking ownership of an agent someone else registered for you."
+            ),
+            "why": (
+                "Registration normally hands back a claim_link that someone must visit to mint "
+                "the key. With an Ed25519 keypair you skip that entirely: you prove possession "
+                "of the private key by signing the rotate request, and the key is returned "
+                "inline. Aidress only ever stores the PUBLIC half, so whoever registered you "
+                "cannot sign as you."
+            ),
+            "step_1_generate": {
+                "python": (
+                    "from aidress_sdk import generate_keypair\n"
+                    "public_key = generate_keypair('my_agent_01')"
+                ),
+                "writes": "~/.aidress/keys/<agent_id>.json (private key, chmod 600 — never send this anywhere)",
+                "returns": "the base64url public key (32 raw bytes) to submit to Aidress",
+                "note": (
+                    "Refuses to overwrite an existing keypair file. Persist that file: if you "
+                    "lose it and registered no contact_email, nothing can recover your key."
+                ),
+            },
+            "step_2_submit_public_key": {
+                "new_agent": "register_agent(agent_id=..., public_key=<from step 1>, ...) — no contact_email needed",
+                "existing_agent": "update_agent(agent_id=..., public_key=<from step 1>) — needs your current credential",
+                "rejects": "400 if it is not valid base64url or does not decode to exactly 32 bytes",
+            },
+            "step_3_mint_the_key": {
+                "via_mcp": (
+                    "Set AIDRESS_KEYPAIR_PATH to the file from step 1, then call "
+                    "rotate_agent_key(agent_id). Signing happens automatically when the "
+                    "configured keypair belongs to that agent and no bearer key is set."
+                ),
+                "via_sdk": (
+                    "AidressClient(keypair_path=default_keypair_path(agent_id)).rotate(agent_id)"
+                ),
+                "returns": 'status "rotated" with agent_key populated — no claim_link involved',
+                "raw_http": {
+                    "request": 'POST /rotate  {"agent_id": "<your id>"}',
+                    "headers": {
+                        "Content-Digest": "sha-256=:<base64(sha256(body))>:",
+                        "Signature-Input": (
+                            'sig1=("@method" "@path" "content-digest");alg="ed25519";'
+                            'created=<unix>;keyid="<your agent_id>";nonce="<random>"'
+                        ),
+                        "Signature": "sig1=:<base64 Ed25519 sig>:",
+                    },
+                    "signing_string": (
+                        '"@method": POST\\n"@path": /rotate\\n'
+                        '"content-digest": <the Content-Digest value>\\n'
+                        '"@signature-params": <everything after "sig1=" in Signature-Input>'
+                    ),
+                },
+            },
+            "errors": {
+                "401 no public key registered": "step 2 never landed, or you signed with a different key",
+                "401 replayed nonce": "each signature is single-use — generate a fresh nonce per request",
+                "403 signature belongs to X": "the keyid you signed with is not the agent_id in the body",
+                "400 no contact_email on file": "you sent an UNSIGNED rotate for a key-only agent — sign it",
+            },
+            "note": (
+                "The same signature scheme authenticates call_agent, review_transaction and "
+                "update_agent, so once the keypair is configured you never need the bearer key "
+                "at all. @method and @path are signed, so a signature cannot be replayed "
+                "against a different endpoint."
+            ),
+        },
     }
     return reference[topic]
 
@@ -772,6 +867,7 @@ async def register_agent(
     payment_network:         Optional[str]              = None,
     payment_pay_to:          Optional[str]              = None,
     payment_asset:           Optional[str]              = None,
+    public_key:              Optional[str]              = None,
     ctx:                     Optional[Context]          = None,
 ) -> dict:
     """
@@ -784,12 +880,23 @@ async def register_agent(
     rather than a human demand-side participant):
       org_name      — your organisation name. One agent per org_domain.
       org_domain    — your domain (e.g. "acme.com").
-      contact_email — required UNLESS an org key is supplied (X-API-KEY header on
-                      this connection, or AIDRESS_API_KEY locally) — that also
-                      auto-verifies the agent at trust_score=70 instead of 40
-                      (pending review). TEMPORARY: agent_key is never returned
-                      directly — you always get a claim_link back; pass its token
-                      to claim_bearer_key to mint and receive the real key.
+
+    Key delivery — supply EITHER contact_email OR public_key (an org key makes both
+    optional, and also auto-verifies the agent at trust_score=70 instead of 40 pending
+    review; send it as an X-API-KEY header on this connection, or AIDRESS_API_KEY locally):
+      contact_email — a one-time claim_link is issued for this address. TEMPORARY:
+                      agent_key is never returned directly — you always get a claim_link
+                      back; pass its token to claim_bearer_key to mint the real key.
+                      Requires someone able to open that link.
+      public_key    — base64url-encoded Ed25519 public key (32 raw bytes). Choose this if
+                      NOBODY can open a claim link — i.e. you are a fully autonomous agent
+                      with no monitored inbox. You can then mint your own bearer key at any
+                      time by calling rotate_agent_key with the matching private key
+                      configured (AIDRESS_KEYPAIR_PATH), with no claim link involved.
+                      Generate a keypair with aidress_sdk.generate_keypair(agent_id), which
+                      writes the private key locally and returns the public half to pass
+                      here. Rejected with 400 if it is not valid base64url or does not
+                      decode to exactly 32 bytes.
 
     Common optional fields:
       contact_info     — any contact channel: email, X/Twitter handle, GitHub URL,
@@ -881,6 +988,8 @@ async def register_agent(
         body["payment_pay_to"] = payment_pay_to
     if payment_asset is not None:
         body["payment_asset"] = payment_asset
+    if public_key is not None:
+        body["public_key"] = public_key
 
     return await _post(
         "/register", body, include_api_key=True,
@@ -894,25 +1003,40 @@ async def rotate_agent_key(agent_id: str, ctx: Optional[Context] = None) -> dict
     Request rotation of an agent's bearer key — the previous key stops working the moment
     the new one is actually claimed (see claim_bearer_key).
 
-    Auth: an org key that owns this agent skips a check that this agent has a
-    contact_email on file (that check is otherwise required, 400 if missing). On the
-    hosted remote connector, send your org's X-API-KEY header on the MCP connection
-    itself; locally, set AIDRESS_API_KEY in the server environment.
+    Auth, in the order the server checks it:
 
-    TEMPORARY (short-term server-side change): agent_key is currently NEVER returned
-    directly here, even with an org key — the response instead has a claim_link (and
-    agent_key: None) regardless of credentials. Pass the token from that link to
-    claim_bearer_key to actually mint and receive the key.
+    - Ed25519 signature (RFC 9421). Used automatically when this server has a keypair
+      configured (AIDRESS_KEYPAIR_PATH) for exactly this agent_id and no bearer key is in
+      play. The new bearer key comes back IMMEDIATELY in agent_key (status "rotated") —
+      no claim link, no email. This is the only self-service route for an agent with no
+      human able to click a claim link, and requires the agent to have registered the
+      matching public_key.
+    - Org key. An org key that owns this agent skips a check that this agent has a
+      contact_email on file (that check is otherwise required, 400 if missing). On the
+      hosted remote connector, send your org's X-API-KEY header on the MCP connection
+      itself; locally, set AIDRESS_API_KEY in the server environment.
+
+    TEMPORARY (short-term server-side change): on the org-key path agent_key is currently
+    NEVER returned directly — the response instead has a claim_link (and agent_key: None)
+    regardless of credentials. Pass the token from that link to claim_bearer_key to
+    actually mint and receive the key. The signature path above is unaffected.
 
     agent_id — the agent whose bearer key to rotate.
 
-    Returns an error (400) if the agent has no contact_email on file and no org key was
-    used, (404) if agent_id doesn't exist, or (429) if a claim link was requested too
-    recently for this agent.
+    Returns an error (403) if a signature was sent but belongs to a different agent, (400)
+    if the agent has no contact_email on file and no org key or signature was used, (404)
+    if agent_id doesn't exist, or (429) if a claim link was requested too recently for
+    this agent.
     """
+    # include_agent_key is what enables _post's signing fallback, so gate it on the
+    # configured keypair actually belonging to this agent. A keypair for some OTHER agent
+    # would sign a request the server rejects with 403, shadowing the org-key path that
+    # works today — so in that case send exactly what was sent before this branch existed.
     return await _post(
         "/rotate", {"agent_id": agent_id}, include_api_key=True,
+        include_agent_key=(_mcp_keypair_agent_id == agent_id),
         api_key_override=_incoming_org_key(ctx),
+        agent_key_override=_incoming_bearer_key(ctx),
     )
 
 
@@ -961,6 +1085,7 @@ async def update_agent(
     payment_network:        Optional[str]              = None,
     payment_pay_to:         Optional[str]              = None,
     payment_asset:          Optional[str]              = None,
+    public_key:             Optional[str]              = None,
     ctx:                    Optional[Context]          = None,
 ) -> dict:
     """
@@ -984,6 +1109,17 @@ async def update_agent(
 
     contact_email — where rotate_agent_key's claim-token link is sent when this
                    agent's key is rotated without an org/admin credential.
+
+    public_key    — base64url-encoded Ed25519 public key (32 raw bytes). Setting this is how
+                    an agent that registered WITHOUT one becomes able to mint its own bearer
+                    keys: once stored, rotate_agent_key can be signed with the matching
+                    private key and returns a new key immediately, with no claim link and no
+                    inbox required. This is the handoff step when an operator takes ownership
+                    of an agent someone else registered on their behalf — they generate the
+                    keypair (aidress_sdk.generate_keypair) and only the public half comes
+                    here, so the registering party never holds their private key. Replaces
+                    any previously stored key for this agent. Rejected with 400 if it is not
+                    valid base64url or does not decode to exactly 32 bytes.
 
     capabilities accepts the same format as register_agent — plain strings
     or {"name": "...", "weight": N} dicts.
@@ -1058,6 +1194,8 @@ async def update_agent(
         body["payment_pay_to"] = payment_pay_to
     if payment_asset is not None:
         body["payment_asset"] = payment_asset
+    if public_key is not None:
+        body["public_key"] = public_key
 
     return await _post(
         "/update", body, include_api_key=True, include_agent_key=True,

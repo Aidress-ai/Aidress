@@ -14,6 +14,7 @@ from pydantic import ValidationError
 from langchain_aidress import (
     AidressCallAgentTool,
     AidressClaimBearerKeyTool,
+    AidressGenerateKeypairTool,
     AidressGetAgentTool,
     AidressImportAgentTool,
     AidressListRegistryTool,
@@ -140,6 +141,40 @@ class TestDelegation:
         client.return_value.review.assert_called_once_with(True, 9, None, "a", "b")
 
 
+class TestGenerateKeypair:
+    """The keypair tool is local-only and must not raise out of the agent loop."""
+
+    KEYGEN = "langchain_aidress.tools.generate_keypair"
+
+    def test_returns_public_key_and_path(self) -> None:
+        with patch(self.KEYGEN, return_value="pub-b64") as keygen:
+            out = AidressGenerateKeypairTool().invoke({"agent_id": "agent_x"})
+        keygen.assert_called_once_with("agent_x")
+        assert out["public_key"] == "pub-b64"
+        assert out["agent_id"] == "agent_x"
+        assert out["keypair_path"].endswith("/.aidress/keys/agent_x.json")
+
+    def test_never_touches_the_network(self) -> None:
+        # No SDK client should be constructed: generating a keypair is local, and
+        # building a client would imply credentials this tool must not need.
+        with patch(CLIENT) as client, patch(self.KEYGEN, return_value="pub"):
+            AidressGenerateKeypairTool().invoke({"agent_id": "agent_x"})
+        client.assert_not_called()
+
+    def test_existing_keypair_is_an_error_dict_not_an_exception(self) -> None:
+        # An escaping FileExistsError aborts the whole agent run; "you already have
+        # one" is a normal branch and must come back as data the model can act on.
+        with patch(self.KEYGEN, side_effect=FileExistsError("already exists at ...")):
+            out = AidressGenerateKeypairTool().invoke({"agent_id": "agent_x"})
+        assert out["already_exists"] is True
+        assert "error" in out
+
+    def test_missing_cryptography_is_an_error_dict(self) -> None:
+        with patch(self.KEYGEN, side_effect=ImportError("needs cryptography")):
+            out = AidressGenerateKeypairTool().invoke({"agent_id": "agent_x"})
+        assert "cryptography" in out["error"]
+
+
 class TestClientConfiguration:
     """Tool configuration is passed through to the SDK client."""
 
@@ -149,6 +184,7 @@ class TestClientConfiguration:
         assert client.call_args.kwargs == {
             "base_url": "https://api.aidress.ai",
             "agent_key": None,
+            "keypair_path": None,
             "timeout": 30.0,
             "retry_budget": 10.0,
         }
@@ -158,15 +194,23 @@ class TestClientConfiguration:
             AidressVerifyAgentTool(
                 base_url="https://staging.example.com",
                 agent_key="sk-1",
+                keypair_path="/tmp/kp.json",
                 timeout=5.0,
                 retry_budget=2.0,
             ).invoke({"agent_id": "a"})
         assert client.call_args.kwargs == {
             "base_url": "https://staging.example.com",
             "agent_key": "sk-1",
+            "keypair_path": "/tmp/kp.json",
             "timeout": 5.0,
             "retry_budget": 2.0,
         }
+
+    def test_keypair_path_read_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("AIDRESS_KEYPAIR_PATH", "/tmp/env-kp.json")
+        with patch(CLIENT) as client:
+            AidressVerifyAgentTool().invoke({"agent_id": "a"})
+        assert client.call_args.kwargs["keypair_path"] == "/tmp/env-kp.json"
 
     def test_agent_key_read_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("AIDRESS_AGENT_KEY", "sk-env")
@@ -192,6 +236,15 @@ class TestValidation:
         with pytest.raises(ValidationError):
             AidressVerifyAgentTool().invoke({})
 
+    def test_review_requires_both_party_ids(self) -> None:
+        # Nothing carries the ids over from aidress_call_agent — each tool builds its
+        # own client, so the SDK's handle cache is always empty here. Omitting them
+        # used to produce a guaranteed 422 from the server instead of a local error.
+        with pytest.raises(ValidationError):
+            AidressReviewTransactionTool(agent_key="k").invoke(
+                {"success": True, "score": 9, "transaction_id": "txn-1"}
+            )
+
 
 class TestToolkit:
     def test_open_tools_without_credentials(self) -> None:
@@ -203,15 +256,22 @@ class TestToolkit:
             "aidress_list_registry",
             "aidress_import_agent",
             "aidress_register_agent",
+            "aidress_generate_keypair",
             "aidress_rotate_agent_key",
             "aidress_claim_bearer_key",
         }
 
     def test_keyless_set_can_bootstrap_a_credential(self) -> None:
-        # register → claim is the only path to a key, so both must be reachable
-        # without one, or the toolkit cannot get an agent off the ground.
+        # Both routes to a first key must be reachable without one, or the toolkit
+        # cannot get an agent off the ground: register → claim (needs an inbox), and
+        # generate_keypair → register → signed rotate (needs nothing).
         names = {t.name for t in AidressToolkit().get_tools()}
         assert {"aidress_register_agent", "aidress_claim_bearer_key"} <= names
+        assert {
+            "aidress_generate_keypair",
+            "aidress_register_agent",
+            "aidress_rotate_agent_key",
+        } <= names
 
     def test_agent_key_unlocks_transacting_tools(self) -> None:
         names = {t.name for t in AidressToolkit(agent_key="k").get_tools()}
@@ -222,7 +282,7 @@ class TestToolkit:
         } <= names
 
     def test_include_all_returns_every_tool(self) -> None:
-        assert len(AidressToolkit(include_all=True).get_tools()) == 11
+        assert len(AidressToolkit(include_all=True).get_tools()) == 12
 
     def test_config_propagates_to_tools(self) -> None:
         tools = AidressToolkit(

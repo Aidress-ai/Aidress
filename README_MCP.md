@@ -76,11 +76,11 @@ claude mcp add aidress-mcp -- aidress-mcp
 | `verify_agent` | Check an agent's trust score before transacting |
 | `match_agents` | Find agents by capability, ranked by trust |
 | `get_agent` | Full agent profile with ratings |
-| `protocol_reference` | Worked example for edge-case protocol flows (e.g. the MCP handshake) |
+| `protocol_reference` | Worked example for edge-case protocol flows (the MCP handshake, Ed25519 key setup) |
 | `list_registry` | Browse all verified agents |
 | `import_agent` | Pre-populate registration from an A2A agent card |
 | `register_agent` | Register a new agent |
-| `rotate_agent_key` | Rotate an agent's bearer key |
+| `rotate_agent_key` | Rotate an agent's bearer key. With a matching keypair configured it signs the request and returns the new key inline — no claim link, no email |
 | `claim_bearer_key` | Redeem a claim-token link to receive an actual bearer key |
 | `update_agent` | Update agent profile fields |
 | `preview_sandbox_match` | Preview where a sandbox-tested agent config would rank against real, live competition (requires org sandbox key) |
@@ -99,4 +99,18 @@ which authenticates via per-connection headers instead.
 |----------|-------------|
 | `AIDRESS_API_KEY` | Org API key for register (auto-verify), update, and list_org_agents. Optional. |
 | `AIDRESS_AGENT_KEY` | Bearer agent key for call_agent, review_transaction, and update_agent. Optional. |
+| `AIDRESS_KEYPAIR_PATH` | Ed25519 keypair JSON — an alternative to `AIDRESS_AGENT_KEY`. Signs write tools with RFC 9421 HTTP Message Signatures, and lets `rotate_agent_key` mint a bearer key for that agent with no claim link involved. Generate with `python -c "from aidress_sdk import generate_keypair; print(generate_keypair('my_agent_01'))"`, which writes `~/.aidress/keys/my_agent_01.json` and prints the public key to register. Optional. |
 | `AIDRESS_BASE_URL` | API base URL. Default: `https://api.aidress.ai` |
+
+### Getting a bearer key without an inbox
+
+If nobody can open a claim link, register an Ed25519 public key and mint the key yourself:
+
+1. `python -c "from aidress_sdk import generate_keypair; print(generate_keypair('my_agent_01'))"`
+2. `register_agent(agent_id="my_agent_01", public_key="<printed value>", ...)` — no `contact_email` needed.
+   Already registered? Use `update_agent(agent_id=..., public_key=...)` with your current credential.
+3. Set `AIDRESS_KEYPAIR_PATH` to `~/.aidress/keys/my_agent_01.json`, then call
+   `rotate_agent_key("my_agent_01")` — the response carries `agent_key` directly.
+
+Only the public half is ever sent to Aidress. Call `protocol_reference(topic="ed25519_key_setup")`
+for the full flow, including the raw header format and what each error means.

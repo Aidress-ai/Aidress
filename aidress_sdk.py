@@ -200,11 +200,28 @@ class AidressClient:
         if resolved_path:
             self._load_keypair(resolved_path)  # explicit — let errors surface
         else:
+            # Auto-discovery, in order: the legacy single-file path first (so existing
+            # installs keep working untouched), then the per-agent keys/ directory.
+            # A keys/ directory is only usable here when it holds EXACTLY ONE keypair —
+            # this client has no agent_id at construction time, so with several present
+            # there is nothing to pick by, and loading an arbitrary one would sign
+            # requests as the wrong agent. Multi-agent callers pass keypair_path
+            # explicitly (see default_keypair_path).
             from pathlib import Path
-            default = Path("~/.aidress/keypair.json").expanduser()
-            if default.exists():
+            candidates = []
+            legacy = Path("~/.aidress/keypair.json").expanduser()
+            if legacy.exists():
+                candidates.append(legacy)
+            else:
+                keys_dir = Path("~/.aidress/keys").expanduser()
+                if keys_dir.is_dir():
+                    found = sorted(keys_dir.glob("*.json"))
+                    if len(found) == 1:
+                        candidates.append(found[0])
+            for cand in candidates:
                 try:
-                    self._load_keypair(str(default))
+                    self._load_keypair(str(cand))
+                    break
                 except Exception:
                     pass  # cryptography not installed or file malformed — skip silently
 
@@ -516,6 +533,23 @@ class AidressClient:
         status, resp = self._post("/call", body, _bearer=self._agent_key, _sign=True, _x_payment=x_payment, _mcp_session_id=mcp_session_id)
         if status == 0:
             return dict(_UNREACHABLE)
+        # Error mapping here CANNOT key off the HTTP status, because /call relays the
+        # target's status as its own: a target that answers 402 makes /call itself answer
+        # 402, with a perfectly good proxy result in the body. Keying off `status` would
+        # turn an x402 payment challenge — which the caller needs in order to pay — into
+        # an opaque error string.
+        #
+        # The two cases are told apart by body SHAPE instead, which is unambiguous:
+        #   proxy result    -> {"status_code", "body", "response_headers", "transaction_id",
+        #                       "agent_id"}  — returned as-is at any status; the target's
+        #                       own outcome lives in status_code for the caller to inspect.
+        #   Aidress refusal -> {"detail"} — the call never happened (bad key, unknown agent,
+        #                       24h review block), so there is no transaction to review and
+        #                       it must surface as {"error": ...} like every other method.
+        _proxied = isinstance(resp, dict) and ("status_code" in resp or "transaction_id" in resp)
+        if not _proxied and not 200 <= status < 300:
+            detail = resp.get("detail") if isinstance(resp, dict) else resp
+            return {"error": f"Call rejected by Aidress (HTTP {status}): {detail}"}
         # Cache the handle AND both party ids for the next review() call. /review requires
         # caller_agent_id and receiver_agent_id, so caching only the transaction_id made
         # the documented no-argument review() 422 with a validation error.
@@ -712,30 +746,57 @@ class AidressClient:
         Request rotation of agent_id's bearer key — the previous key stops working the
         moment the new one is actually claimed (see claim()).
 
-        Requires either an org X-API-KEY (this client has no way to send one) or
-        Authorization: Bearer <ADMIN_KEY> (agent_key set to a real admin key, via the
-        constructor or set_agent_key()) to skip a check that this agent has a contact_email
-        on file — that check is skipped for org/admin, required otherwise (400 if missing).
+        Two outcomes, depending on what this client can prove:
 
-        TEMPORARY (short-term server-side change): agent_key is currently NEVER returned
-        directly here, even with ADMIN_KEY — the response instead has a claim_link (and
-        agent_key: None) regardless of credentials. Pass the token from that link
-        (everything after "token=") to claim() to actually mint and receive the key.
+        1. SIGNED (no claim link needed). If this client has loaded an Ed25519 keypair whose
+           agent_id is exactly the agent_id being rotated, the request is signed (RFC 9421)
+           and the server returns the new bearer key directly — status "rotated", agent_key
+           populated, auto-captured into this client. This is the self-service path for an
+           agent with nobody to read a claim email; it requires that the agent registered
+           the matching public_key (see generate_keypair() and register(public_key=...)).
+           The bearer key is deliberately NOT sent in this case: the server checks bearer
+           before signature, and a bearer credential does not unlock this path.
 
-        Returns a dict with an "error" key if agent_id doesn't exist (404), has no
-        contact_email on file and no org/admin credential was used (400), or a claim
-        link was requested too recently for this agent (429).
+        2. UNSIGNED. Falls back to sending Authorization: Bearer <self._agent_key>, which is
+           only meaningful as an ADMIN_KEY. Requires either that admin key or an org
+           X-API-KEY (this client has no way to send one) to skip a check that this agent
+           has a contact_email on file — that check is skipped for org/admin, required
+           otherwise (400 if missing).
 
-        from aidress_sdk import rotate, claim
-        result = rotate("my_agent_01")
-        token = result["claim_link"].rsplit("token=", 1)[-1]
-        claim(token)
+           TEMPORARY (short-term server-side change): on this path agent_key is currently
+           NEVER returned directly, even with ADMIN_KEY — the response instead has a
+           claim_link (and agent_key: None) regardless of credentials. Pass the token from
+           that link (everything after "token=") to claim() to mint and receive the key.
+
+        Returns a dict with an "error" key if agent_id doesn't exist (404), the signature
+        belongs to a different agent (403), the agent has no contact_email on file and no
+        org/admin credential or signature was used (400), or a claim link was requested too
+        recently for this agent (429).
+
+        from aidress_sdk import AidressClient, generate_keypair
+        pub = generate_keypair("my_agent_01")            # once, at first setup
+        # ... register("my_agent_01", ..., public_key=pub) ...
+        c = AidressClient()                             # auto-loads ~/.aidress/keypair.json
+        c.rotate("my_agent_01")["agent_key"]            # signed — key returned immediately
         """
-        status, resp = self._post("/rotate", {"agent_id": agent_id}, _bearer=self._agent_key)
+        # Sign only when this client holds THIS agent's keypair. A keypair for a different
+        # agent would produce a signature the server rejects with 403, which would also
+        # shadow the ADMIN_KEY path below — so in that case fall through unsigned.
+        signing = bool(self._private_key and self._keypair_agent_id == agent_id)
+        status, resp = self._post(
+            "/rotate",
+            {"agent_id": agent_id},
+            _bearer=None if signing else self._agent_key,
+            _sign=signing,
+        )
         if status == 0:
             return dict(_UNREACHABLE)
-        if status in (400, 404, 429):
+        if status in (400, 403, 404, 429):
             return {"error": resp.get("detail", "Could not start key rotation")}
+        # Signed rotations return the key inline — capture it so subsequent update()/call()/
+        # review() calls authenticate with the new key instead of the now-invalidated old one.
+        if isinstance(resp, dict) and resp.get("agent_key"):
+            self._agent_key = resp["agent_key"]
         return resp
 
     def claim(self, token: str) -> dict:
@@ -838,6 +899,13 @@ class AidressClient:
             return {"error": f"Agent '{agent_id}' not found"}
         if status in (401, 403):
             return {"error": resp.get("detail", "Not authorised to update this agent")}
+        if status >= 400:
+            # Catch-all, matching register(). Without it any other 4xx/5xx — a malformed
+            # public_key (400), a capability validation failure (422) — fell through as the
+            # raw {"detail": ...} FastAPI shape, which has no "error" key, so callers
+            # checking result.get("error") saw a failed update as a success. The CLI reports
+            # its exit code from that same check, so it exited 0 on a rejected update.
+            return {"error": resp.get("detail", f"Update failed (HTTP {status})")}
         return resp
 
     def get_agent(self, agent_id: str) -> dict:
@@ -978,15 +1046,43 @@ def review(
     return _default_client.review(success, score, transaction_id, caller_agent_id, receiver_agent_id)
 
 
-def generate_keypair(agent_id: str, path: str = "~/.aidress/keypair.json") -> str:
-    """Generate an Ed25519 keypair, save it to path, and return the public_key (base64url).
+def default_keypair_path(agent_id: str) -> str:
+    """Return the per-agent keypair location: ~/.aidress/keys/<agent_id>.json.
+
+    One file per agent, deliberately. The original default was a single shared
+    ~/.aidress/keypair.json holding exactly one agent_id, so generating a keypair for a
+    second agent on the same machine silently overwrote the first agent's PRIVATE key —
+    destroying its only means of signing, and with it any ability to rotate its own bearer
+    key. Bulk registration loops hit this on every iteration but one.
+
+    agent_id is sanitised because it lands in a filesystem path: anything outside
+    [A-Za-z0-9._-] becomes "_", so an id containing "/" or ".." cannot escape the keys
+    directory. Collisions after sanitising are possible in principle but require two agent
+    ids differing only in punctuation.
+    """
+    import re as _re
+    from pathlib import Path
+    safe = _re.sub(r"[^A-Za-z0-9._-]", "_", agent_id).lstrip(".") or "agent"
+    return str(Path("~/.aidress/keys") / f"{safe}.json")
+
+
+def generate_keypair(agent_id: str, path: str | None = None) -> str:
+    """Generate an Ed25519 keypair, save it, and return the public_key (base64url).
 
     Call once per agent. Pass the returned public_key to /register or /update so the server
-    can verify HTTP Message Signatures from this agent.
+    can verify HTTP Message Signatures from this agent — and, once stored, so the agent can
+    mint its own bearer keys by signing /rotate (no claim link, no inbox).
 
-    from aidress_sdk import generate_keypair, AidressClient
+    path defaults to a PER-AGENT file, ~/.aidress/keys/<agent_id>.json — see
+    default_keypair_path for why. Pass an explicit path to override.
+
+    Refuses to overwrite an existing file, because the file holds a private key that
+    nothing else can reconstruct: silently replacing it would strand the agent whose key
+    was there. Delete it deliberately, or pass a different path, to re-key.
+
+    from aidress_sdk import generate_keypair, AidressClient, default_keypair_path
     pub = generate_keypair("my_agent_01")
-    client = AidressClient(keypair_path="~/.aidress/keypair.json")
+    client = AidressClient(keypair_path=default_keypair_path("my_agent_01"))
     client.register("my_agent_01", ..., public_key=pub)   # or update later
     """
     try:
@@ -998,6 +1094,13 @@ def generate_keypair(agent_id: str, path: str = "~/.aidress/keypair.json") -> st
     import base64 as _b64
     from pathlib import Path
 
+    p = Path(path if path is not None else default_keypair_path(agent_id)).expanduser()
+    if p.exists():
+        raise FileExistsError(
+            f"Keypair already exists at {p} — refusing to overwrite a private key. "
+            f"Delete it first to re-key '{agent_id}', or pass an explicit path=."
+        )
+
     private_key = Ed25519PrivateKey.generate()
     public_key  = private_key.public_key()
 
@@ -1007,7 +1110,6 @@ def generate_keypair(agent_id: str, path: str = "~/.aidress/keypair.json") -> st
     priv_b64 = _b64.urlsafe_b64encode(priv_bytes).decode().rstrip("=")
     pub_b64  = _b64.urlsafe_b64encode(pub_bytes).decode().rstrip("=")
 
-    p = Path(path).expanduser()
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps({"agent_id": agent_id, "private_key": priv_b64, "public_key": pub_b64}, indent=2))
     p.chmod(0o600)  # owner-only read/write
