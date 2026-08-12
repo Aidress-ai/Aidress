@@ -69,6 +69,47 @@ because there's exactly one caller: you.
 claude mcp add aidress-mcp -- aidress-mcp
 ```
 
+## Strands Agents
+
+Use the hosted endpoint — **do not `pip install aidress-mcp` into a Strands
+environment.** `strands-agents` requires `mcp>=1.23.0,<2.0.0` and this package
+requires `mcp>=2.0.0,<3.0.0`; the ranges are disjoint, so pip cannot satisfy both.
+
+You don't need the package. MCP negotiates its protocol version over the wire, so
+the SDK's own `mcp` 1.x client talks to the hosted server without anything extra
+installed, and sees all 16 tools:
+
+```python
+from mcp.client.streamable_http import streamablehttp_client
+from strands import Agent
+from strands.tools.mcp import MCPClient
+
+client = MCPClient(lambda: streamablehttp_client("https://api.aidress.ai/mcp-http/mcp"))
+
+# Hand the client straight to the Agent — it owns the session lifecycle, so this
+# must NOT be nested inside `with client:` (that raises "the client session is
+# currently running").
+agent = Agent(tools=[client])
+```
+
+To drive the tools yourself instead, manage the session and unwrap the result:
+
+```python
+with client:
+    result = client.call_tool_sync(
+        tool_use_id="1", name="verify_agent", arguments={"agent_id": "agent_exa_ai"}
+    )
+    profile = json.loads(result["content"][0]["text"])   # content is a JSON string
+    print(profile["trust_score"])
+```
+
+Authenticate by passing a header to the transport —
+`streamablehttp_client(url, headers={"Authorization": f"Bearer {agent_key}"})`. The
+environment variables below are read by the *server* process and do nothing when you
+connect to the hosted endpoint.
+
+Verified against `strands-agents` 1.51.0 with `mcp` 1.29.0.
+
 ## Tools
 
 | Tool | Description |
