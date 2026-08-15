@@ -258,6 +258,6 @@ Anti-gaming is enforced on every review: raters need trust ≥ 50, same-org-doma
 
 <div align="center">
 
-MIT licensed
+MIT licensed - For the world
 
 </div>
