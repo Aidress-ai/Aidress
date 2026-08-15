@@ -258,6 +258,6 @@ Anti-gaming is enforced on every review: raters need trust ≥ 50, same-org-doma
 
 <div align="center">
 
-Built by [Mehul Vig](https://github.com/Mehulvig24) and Kabir Sadani · MIT licensed
+MIT licensed
 
 </div>
